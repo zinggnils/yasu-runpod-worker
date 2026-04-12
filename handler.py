@@ -3,36 +3,37 @@ import cv2
 import numpy as np
 from rembg import remove
 import base64
-from PIL import Image
-import io
+
+def apply_clinical_duotone(img):
+    # Umwandlung in Graustufen für Texturbetonung
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # CLAHE für klinischen Kontrast (Poren sichtbar machen)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    contrast_img = clahe.apply(gray)
+    # DuoTone Mapping (Blau-Töne für medizinischen Look)
+    colored = cv2.applyColorMap(contrast_img, cv2.COLORMAP_BONE)
+    return colored
 
 def handler(job):
     try:
-        # 1. Daten aus dem Request extrahieren
         job_input = job['input']
-        image_b64 = job_input.get('image')
-        
-        if not image_b64:
-            return {"error": "Kein Bild erhalten"}
+        img_data = base64.b64decode(job_input['image'])
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # 2. Base64 zu Bytes umwandeln
-        img_bytes = base64.b64decode(image_b64)
+        # 1. Background Removal (High-End KI)
+        no_bg_img = remove(img)
         
-        # 3. BACKGROUND REMOVAL (KI-gestützt auf GPU)
-        # Hier nutzt er automatisch die NVIDIA Power
-        no_bg_bytes = remove(img_bytes)
-
-        # 4. CLINICAL FILTER / DUOTONE (Vorbereitung)
-        # Hier laden wir später MediaPipe für die Face Detection nach
-        # Für den Start schicken wir das ausgeschnittene Bild zurück
+        # 2. Clinical Filter
+        # Wir nehmen das Bild ohne Hintergrund und legen den Filter drüber
+        clinical_img = apply_clinical_duotone(no_bg_img)
         
-        # 5. Ergebnis zurück zu Base64
-        result_b64 = base64.b64encode(no_bg_bytes).decode('utf-8')
+        # 3. Encoding
+        _, buffer = cv2.imencode('.png', clinical_img)
+        result_b64 = base64.b64encode(buffer).decode('utf-8')
         
         return {"image": result_b64, "status": "success"}
-
     except Exception as e:
         return {"error": str(e)}
 
-# RunPod Loop starten
 runpod.serverless.start({"handler": handler})
