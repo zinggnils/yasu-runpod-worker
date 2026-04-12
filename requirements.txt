@@ -1,0 +1,6 @@
+runpod==1.5.1
+rembg==2.0.52
+onnxruntime-gpu==1.15.1
+opencv-python-headless
+numpy==1.26.2
+pillow
