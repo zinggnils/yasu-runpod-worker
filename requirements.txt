@@ -1,4 +1,5 @@
 runpod
 opencv-python
 numpy
-rembg
+rembg[gpu]
+onnxruntime-gpu
