@@ -1,4 +1,4 @@
 runpod
-opencv-python-headless
+opencv-python
 numpy
 rembg
