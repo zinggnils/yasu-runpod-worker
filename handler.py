@@ -1,28 +1,20 @@
 import runpod
 import cv2
 import numpy as np
-from rembg import remove
+from rembg import remove, new_session
 import base64
 
+# Session einmal global laden für Speed
+session = new_session()
+
 def apply_clinical_duotone(img_rgba):
-    # rembg liefert RGBA. Wir trennen die Kanäle.
-    # img_rgba[:,:,3] ist die Transparenz-Maske
     b, g, r, a = cv2.split(img_rgba)
     rgb_img = cv2.merge((b, g, r))
-
-    # Umwandlung in Graustufen für Texturbetonung
     gray = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
-    
-    # CLAHE für klinischen Kontrast
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     contrast_img = clahe.apply(gray)
-    
-    # DuoTone Mapping (BONE für medizinischen Look)
     colored = cv2.applyColorMap(contrast_img, cv2.COLORMAP_BONE)
-    
-    # Die Transparenz wieder hinzufügen, damit der Hintergrund leer bleibt
-    final_rgba = cv2.merge((colored[:,:,0], colored[:,:,1], colored[:,:,2], a))
-    return final_rgba
+    return cv2.merge((colored[:,:,0], colored[:,:,1], colored[:,:,2], a))
 
 def handler(job):
     try:
@@ -32,16 +24,15 @@ def handler(job):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            return {"error": "Bild konnte nicht dekodiert werden"}
+            return {"error": "Bild-Dekodierung fehlgeschlagen"}
 
-        # 1. Background Removal
-        # Wir nutzen session-less remove für Stabilität im Serverless
-        no_bg_img = remove(img)
+        # 1. Background Removal mit globaler Session
+        no_bg_img = remove(img, session=session)
         
-        # 2. Clinical Filter
+        # 2. Filter
         clinical_img = apply_clinical_duotone(no_bg_img)
         
-        # 3. Encoding als PNG (wichtig für Transparenz)
+        # 3. Encoding
         _, buffer = cv2.imencode('.png', clinical_img)
         result_b64 = base64.b64encode(buffer).decode('utf-8')
         
