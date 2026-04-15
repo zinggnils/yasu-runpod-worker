@@ -1,5 +1,7 @@
-runpod
-opencv-python
-numpy
-rembg[gpu]
-onnxruntime-gpu
+runpod==1.7.7
+numpy<2.0
+opencv-python-headless==4.10.0.84
+
+# Rembg GPU + onnxruntime-gpu pinned:
+rembg[gpu]==2.0.59
+onnxruntime-gpu==1.17.1
