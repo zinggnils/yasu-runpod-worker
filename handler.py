@@ -1,47 +1,45 @@
 import runpod
-import cv2
-import numpy as np
 import base64
-from rembg import remove
+from io import BytesIO
+from PIL import Image, ImageOps
 
-def apply_clinical_duotone(img_rgba):
-    # Konvertierung von RGBA zu BGR (OpenCV Standard)
-    b, g, r, a = cv2.split(img_rgba)
-    rgb_img = cv2.merge((b, g, r))
-    gray = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    contrast_img = clahe.apply(gray)
-    colored = cv2.applyColorMap(contrast_img, cv2.COLORMAP_BONE)
-    # Transparenz wieder hinzufügen
-    return cv2.merge((colored[:,:,0], colored[:,:,1], colored[:,:,2], a))
+def to_b64(img_obj):
+    buffered = BytesIO()
+    img_obj.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+def process_image(image_b64):
+    # 1. Base64 zu PIL Image konvertieren
+    img_data = base64.b64decode(image_b64)
+    img = Image.open(BytesIO(img_data)).convert("RGB")
+
+    # --- KI LOGIK ---
+    # Hier kommen später deine echten Modelle rein.
+    # Für den Test simulieren wir die zwei Outputs:
+    
+    # Output 1: "Clean" (hier könntest du Background Removal machen)
+    clean_img = img.copy() 
+    
+    # Output 2: "Redness" (Simulation des DuoTone Effekts via Filter)
+    redness_img = ImageOps.colorize(ImageOps.grayscale(img), "#000055", "#ff0000")
+    # --- KI LOGIK ENDE ---
+
+    return {
+        "clean_image": to_b64(clean_img),
+        "redness_image": to_b64(redness_img)
+    }
 
 def handler(job):
+    job_input = job['input']
+    image_b64 = job_input.get('image')
+
+    if not image_b64:
+        return {"error": "No image provided"}
+
     try:
-        # Sicherstellen, dass Input da ist
-        job_input = job.get('input', {})
-        if 'image' not in job_input:
-            return {"error": "Kein Bild empfangen"}
-
-        # Bild dekodieren
-        img_data = base64.b64decode(job_input['image'])
-        nparr = np.frombuffer(img_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if img is None:
-            return {"error": "Bild konnte nicht gelesen werden"}
-
-        # 1. Hintergrund entfernen
-        no_bg = remove(img)
-        
-        # 2. Klinischer Filter
-        final_img = apply_clinical_duotone(no_bg)
-        
-        # 3. Encoding
-        _, buffer = cv2.imencode('.png', final_img)
-        result_b64 = base64.b64encode(buffer).decode('utf-8')
-        
-        return {"image": result_b64}
+        # Führt die Verarbeitung aus und liefert clean_image & redness_image
+        return process_image(image_base64)
     except Exception as e:
-        return {"error": f"Worker-Absturz: {str(e)}"}
+        return {"error": str(e)}
 
 runpod.serverless.start({"handler": handler})
