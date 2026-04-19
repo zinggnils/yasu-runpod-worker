@@ -1,3 +1,4 @@
 runpod
 pillow
 rembg
+onnxruntime-gpu==1.17.1
