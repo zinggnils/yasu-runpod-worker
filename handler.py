@@ -1,89 +1,65 @@
 import runpod
 import base64
 from io import BytesIO
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image
 import numpy as np
 import cv2
-import onnxruntime as ort
 from rembg import new_session, remove
 
-# Sanity Checks beim Start
-print(f"ORT version: {ort.__version__}")
-print(f"Available providers: {ort.get_available_providers()}")
-
-# Initialisiere rembg Session (Modell sollte durch Dockerfile bereits in /root/.u2net/ liegen)
-try:
-    session = new_session("u2net", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-    print("Rembg session initialized with CUDA/CPU.")
-except Exception as e:
-    print(f"Failed to initialize GPU session, falling back: {e}")
-    session = new_session("u2net")
+# Session mit GPU-Support
+session = new_session("u2net")
 
 def to_b64(img_obj: Image.Image) -> str:
-    """Konvertiert PIL Image in Base64 String (JPEG für Performance)"""
     buffered = BytesIO()
-    img_obj.convert("RGB").save(buffered, format="JPEG", quality=90)
+    img_obj.convert("RGB").save(buffered, format="JPEG", quality=95)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-def analyze_redness_visia_style(clean_rgba: Image.Image) -> Image.Image:
-    """
-    Erstellt die medizinische Rötungsanalyse (VISIA-Style).
-    Nutzt den LAB-Farbraum zur präzisen Hämoglobin-Isolierung.
-    """
-    # PIL zu OpenCV konvertieren
-    img_np = np.array(clean_rgba.convert("RGB"))
-    
-    # LAB Farbraum Transformation
+def apply_clinical_redness(img_np):
+    """Der 'Blue Marker' Look vom 19.04."""
     lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-
-    # Fokus auf a-Kanal (Rotwerte)
-    a_blurred = cv2.GaussianBlur(a_channel, (5, 5), 0)
+    l, a, b = cv2.split(lab)
     
-    # Kontrastspreizung für die Visualisierung
-    min_val = np.percentile(a_blurred, 45) # Basiswert Haut
-    max_val = np.percentile(a_blurred, 98) # Spitzenwerte Rötung
-    
+    # Isoliere Rötungen im a-Kanal
+    a_blurred = cv2.GaussianBlur(a, (5, 5), 0)
+    min_val, max_val = np.percentile(a_blurred, [45, 98])
     redness_map = np.clip((a_blurred - min_val) / (max_val - min_val + 1e-5) * 255, 0, 255).astype(np.uint8)
-
-    # Heatmap generieren (Blau-Gelb-Rot Look)
-    heatmap = cv2.applyColorMap(redness_map, cv2.COLORMAP_JET)
     
-    # Überlagerung mit dem Original für Kontext
-    result_np = cv2.addWeighted(heatmap, 0.75, img_np, 0.25, 0)
-
-    return Image.fromarray(result_np)
+    # Erstelle den bläulichen klinischen Look (COLORMAP_JET oder speziell gemischt)
+    heatmap = cv2.applyColorMap(redness_map, cv2.COLORMAP_JET)
+    return cv2.addWeighted(heatmap, 0.7, img_np, 0.3, 0)
 
 def process_image(image_b64: str):
-    """Verarbeitet das Bild und gibt 3 Varianten zurück"""
-    # 1. Original Scan dekomprimieren & speichern
+    # Original laden
     img_data = base64.b64decode(image_b64)
-    original_img = Image.open(BytesIO(img_data)).convert("RGB")
+    original = Image.open(BytesIO(img_data)).convert("RGB")
+    orig_np = np.array(original)
 
-    # 2. Hintergrund entfernen (Clean)
-    clean_rgba = remove(original_img, session=session).convert("RGBA")
-    
-    # Hintergrund für 'Clean' weiß füllen
+    # 1. Output: Clean (Hintergrund weg)
+    clean_rgba = remove(original, session=session)
     clean_bg = Image.new("RGB", clean_rgba.size, (255, 255, 255))
     clean_bg.paste(clean_rgba, mask=clean_rgba.split()[3])
 
-    # 3. Rötungsanalyse (Redness)
-    redness_img = analyze_redness_visia_style(clean_rgba)
+    # 2. Output: Redness Analysis (Der bläuliche Look aus dem Design)
+    # Wir wenden die Analyse auf das freigestellte Gesicht an
+    clean_np = np.array(clean_bg)
+    redness_np = apply_clinical_redness(clean_np)
+    redness_img = Image.fromarray(redness_np)
 
-    # Rückgabe aller drei Bilder
+    # 3. Output: Skin Mask Toggle (Analyse ohne Hintergrundmaske)
+    # Hier wird die Analyse auf das volle Originalbild angewendet
+    full_redness_np = apply_clinical_redness(orig_np)
+    full_redness_img = Image.fromarray(full_redness_np)
+
     return {
-        "scan_image": to_b64(original_img),
         "clean_image": to_b64(clean_bg),
-        "redness_image": to_b64(redness_img)
+        "redness_image": to_b64(redness_img),
+        "full_analysis": to_b64(full_redness_img)
     }
 
 def handler(job):
     job_input = job.get("input", {})
     image_b64 = job_input.get("image")
-    
-    if not image_b64:
-        return {"error": "Kein Bild im Input gefunden (image_base64 erwartet)."}
-
+    if not image_b64: return {"error": "Kein Bild."}
     try:
         return process_image(image_b64)
     except Exception as e:
