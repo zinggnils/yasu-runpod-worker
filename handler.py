@@ -101,49 +101,57 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     result.paste(duotone, mask=alpha_mask)
     return result
 
-def process_image(image_b64: str, skin_mask: bool = True):
+ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
+
+def process_single(image_b64: str) -> dict:
+    """Process one image: returns clean, redness (mask ON), visia, full_analysis (mask OFF)."""
     img_data = base64.b64decode(image_b64)
     original = Image.open(BytesIO(img_data)).convert("RGB")
 
-    # Remove background once
     clean_rgba = remove(original, session=session).convert("RGBA")
 
-    # Output 1: clean base — sharpened face on black background
     clean_img = on_black(clean_rgba, sharpen=True)
-
-    # Output 2 (left panel): redness overlay on black bg (skin mask ON state)
     redness_img = make_redness_overlay(clean_rgba)
-
-    # Output 3 (right panel): VISIA duotone — always produced
     visia_img = make_visia_duotone(clean_rgba)
 
-    result = {
+    # Skin mask OFF: redness on full original (no bg removal)
+    r, g, b = original.split() if False else (None, None, None)
+    original_rgba = original.convert("RGBA")
+    orig_r, orig_g, orig_b, _ = original_rgba.split()
+    opaque_alpha = Image.new("L", original_rgba.size, 255)
+    original_full = Image.merge("RGBA", (orig_r, orig_g, orig_b, opaque_alpha))
+    full_analysis_img = make_redness_overlay(original_full)
+
+    return {
         "clean_image": to_b64(clean_img),
         "redness_image": to_b64(redness_img),
         "visia_image": to_b64(visia_img),
+        "full_analysis": to_b64(full_analysis_img),
     }
-
-    # Skin mask OFF: also return redness overlay on full original (no bg removal)
-    if not skin_mask:
-        original_rgba = original.convert("RGBA")
-        # Make all pixels fully opaque for full-image analysis
-        r, g, b, a = original_rgba.split()
-        a = Image.new("L", original_rgba.size, 255)
-        original_full = Image.merge("RGBA", (r, g, b, a))
-        result["full_analysis"] = to_b64(make_redness_overlay(original_full))
-
-    return result
 
 def handler(job):
     job_input = job.get("input", {})
+
+    # Multi-angle mode: images dict keyed by angle
+    images = job_input.get("images")
+    if images and isinstance(images, dict):
+        results = {}
+        for key in ANGLE_KEYS:
+            b64 = images.get(key)
+            if b64:
+                try:
+                    results[key] = process_single(b64)
+                except Exception as e:
+                    results[key] = {"error": str(e)}
+        return {"angles": results}
+
+    # Single image fallback (backward compat)
     image_b64 = job_input.get("image")
     if not image_b64:
-        return {"error": "No image provided. Send base64 under input.image"}
-
-    skin_mask = job_input.get("skin_mask", True)
+        return {"error": "No image provided. Send base64 under input.image or input.images"}
 
     try:
-        return process_image(image_b64, skin_mask=skin_mask)
+        return process_single(image_b64)
     except Exception as e:
         return {"error": str(e)}
 
