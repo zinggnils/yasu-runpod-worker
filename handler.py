@@ -1,8 +1,9 @@
 import runpod
 import base64
 from io import BytesIO
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from PIL import Image, ImageFilter
 import numpy as np
+import cv2
 import onnxruntime as ort
 from rembg import new_session, remove
 
@@ -70,34 +71,34 @@ def make_redness_overlay(clean_rgba: Image.Image) -> Image.Image:
 
 def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     """
-    VISIA-style clinical duotone. Right panel output.
-    - Redness-weighted grayscale: R channel weighted higher → red areas appear brighter
-    - High contrast: near-black shadows, bright light-blue highlights
-    - Sharpened to reveal skin texture
-    - Black background
+    VISIA-style clinical duotone using CLAHE + COLORMAP_BONE.
+    Matches the April 18 reference output (scan_0d9e4d41 / scan_7aa3ea77).
     """
     clean_rgba = clean_rgba.convert("RGBA")
-    alpha = clean_rgba.split()[3]
-    rgb_arr = np.array(clean_rgba.convert("RGB")).astype(np.float32)
+    alpha_arr = np.array(clean_rgba.split()[3])
 
-    r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
+    # Convert to BGR for OpenCV
+    rgb_arr = np.array(clean_rgba.convert("RGB"))
+    bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
 
-    # Redness-weighted grayscale: weight R more so redness = brighter in duotone
-    redness_gray = np.clip(0.55 * r + 0.25 * g + 0.20 * b, 0, 255).astype(np.uint8)
-    gray_img = Image.fromarray(redness_gray, mode="L")
+    # Grayscale
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-    # Sharpen to reveal skin texture
-    gray_img = gray_img.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=2))
+    # CLAHE: adaptive contrast for clinical pore/texture visibility
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
 
-    # Boost contrast so shadows are very dark, highlights very bright
-    gray_img = ImageEnhance.Contrast(gray_img).enhance(1.4)
+    # BONE colormap: black → blue-grey → near-white (clinical look)
+    bone = cv2.applyColorMap(contrast, cv2.COLORMAP_BONE)
 
-    # Duotone: very dark navy → bright almost-white light blue
-    duotone = ImageOps.colorize(gray_img, black=(3, 5, 18), white=(210, 225, 248))
+    # Convert back to PIL RGB
+    bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
+    duotone = Image.fromarray(bone_rgb, mode="RGB")
 
     # Place on black background using face alpha
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
-    result.paste(duotone, mask=alpha)
+    alpha_mask = Image.fromarray(alpha_arr, mode="L")
+    result.paste(duotone, mask=alpha_mask)
     return result
 
 def process_image(image_b64: str, skin_mask: bool = True):
