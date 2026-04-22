@@ -1,67 +1,149 @@
 import runpod
 import base64
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageFilter
 import numpy as np
 import cv2
+import onnxruntime as ort
 from rembg import new_session, remove
 
-# Session mit GPU-Support
-session = new_session("u2net")
+print(f"ORT version: {ort.__version__}")
+print(f"Available providers: {ort.get_available_providers()}")
+
+try:
+    session = new_session("u2net", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    print("Rembg session initialized with CUDA/CPU.")
+except Exception as e:
+    print(f"Failed to initialize GPU session, falling back: {e}")
+    session = new_session("u2net")
 
 def to_b64(img_obj: Image.Image) -> str:
     buffered = BytesIO()
-    img_obj.convert("RGB").save(buffered, format="JPEG", quality=95)
+    img_obj.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-def apply_clinical_redness(img_np):
-    """Der 'Blue Marker' Look vom 19.04."""
-    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    
-    # Isoliere Rötungen im a-Kanal
-    a_blurred = cv2.GaussianBlur(a, (5, 5), 0)
-    min_val, max_val = np.percentile(a_blurred, [45, 98])
-    redness_map = np.clip((a_blurred - min_val) / (max_val - min_val + 1e-5) * 255, 0, 255).astype(np.uint8)
-    
-    # Erstelle den bläulichen klinischen Look (COLORMAP_JET oder speziell gemischt)
-    heatmap = cv2.applyColorMap(redness_map, cv2.COLORMAP_JET)
-    return cv2.addWeighted(heatmap, 0.7, img_np, 0.3, 0)
+def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
+    """Place background-removed face on pure black background, optionally sharpened."""
+    clean_rgba = clean_rgba.convert("RGBA")
+    alpha = clean_rgba.split()[3]
 
-def process_image(image_b64: str):
-    # Original laden
+    rgb = clean_rgba.convert("RGB")
+    if sharpen:
+        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+
+    result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
+    result.paste(rgb, mask=alpha)
+    return result
+
+def make_redness_overlay(clean_rgba: Image.Image) -> Image.Image:
+    """
+    Sharpened face on black background + neon blue overlay where redness is high.
+    Left panel output (skin mask ON).
+    """
+    clean_rgba = clean_rgba.convert("RGBA")
+    rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
+    alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
+
+    r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
+    redness = r - (g + b) / 2.0
+
+    lo, hi = np.percentile(redness[alpha_arr > 0.2], [60, 98]) if np.any(alpha_arr > 0.2) else (0, 255)
+    redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+
+    brightness = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+    mask = redness_n * alpha_arr
+    mask *= np.clip((brightness - 0.15) / 0.85, 0.0, 1.0)
+    mask = np.clip((mask - 0.25) / 0.75, 0.0, 1.0)
+
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=6))
+
+    neon = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    neon[..., 0] = 40
+    neon[..., 1] = 220
+    neon[..., 2] = 255
+    neon[..., 3] = np.array(mask_img)
+
+    # Composite neon overlay on sharpened face on black background
+    base = on_black(clean_rgba, sharpen=True).convert("RGBA")
+    overlay = Image.fromarray(neon, mode="RGBA")
+    return Image.alpha_composite(base, overlay).convert("RGB")
+
+def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
+    """
+    VISIA-style clinical duotone using CLAHE + COLORMAP_BONE.
+    Matches the April 18 reference output (scan_0d9e4d41 / scan_7aa3ea77).
+    """
+    clean_rgba = clean_rgba.convert("RGBA")
+    alpha_arr = np.array(clean_rgba.split()[3])
+
+    # Convert to BGR for OpenCV
+    rgb_arr = np.array(clean_rgba.convert("RGB"))
+    bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+
+    # Grayscale
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE: adaptive contrast for clinical pore/texture visibility
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
+
+    # BONE colormap: black → blue-grey → near-white (clinical look)
+    bone = cv2.applyColorMap(contrast, cv2.COLORMAP_BONE)
+
+    # Convert back to PIL RGB
+    bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
+    duotone = Image.fromarray(bone_rgb, mode="RGB")
+
+    # Place on black background using face alpha
+    result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
+    alpha_mask = Image.fromarray(alpha_arr, mode="L")
+    result.paste(duotone, mask=alpha_mask)
+    return result
+
+def process_image(image_b64: str, skin_mask: bool = True):
     img_data = base64.b64decode(image_b64)
     original = Image.open(BytesIO(img_data)).convert("RGB")
-    orig_np = np.array(original)
 
-    # 1. Output: Clean (Hintergrund weg)
-    clean_rgba = remove(original, session=session)
-    clean_bg = Image.new("RGB", clean_rgba.size, (255, 255, 255))
-    clean_bg.paste(clean_rgba, mask=clean_rgba.split()[3])
+    # Remove background once
+    clean_rgba = remove(original, session=session).convert("RGBA")
 
-    # 2. Output: Redness Analysis (Der bläuliche Look aus dem Design)
-    # Wir wenden die Analyse auf das freigestellte Gesicht an
-    clean_np = np.array(clean_bg)
-    redness_np = apply_clinical_redness(clean_np)
-    redness_img = Image.fromarray(redness_np)
+    # Output 1: clean base — sharpened face on black background
+    clean_img = on_black(clean_rgba, sharpen=True)
 
-    # 3. Output: Skin Mask Toggle (Analyse ohne Hintergrundmaske)
-    # Hier wird die Analyse auf das volle Originalbild angewendet
-    full_redness_np = apply_clinical_redness(orig_np)
-    full_redness_img = Image.fromarray(full_redness_np)
+    # Output 2 (left panel): redness overlay on black bg (skin mask ON state)
+    redness_img = make_redness_overlay(clean_rgba)
 
-    return {
-        "clean_image": to_b64(clean_bg),
+    # Output 3 (right panel): VISIA duotone — always produced
+    visia_img = make_visia_duotone(clean_rgba)
+
+    result = {
+        "clean_image": to_b64(clean_img),
         "redness_image": to_b64(redness_img),
-        "full_analysis": to_b64(full_redness_img)
+        "visia_image": to_b64(visia_img),
     }
+
+    # Skin mask OFF: also return redness overlay on full original (no bg removal)
+    if not skin_mask:
+        original_rgba = original.convert("RGBA")
+        # Make all pixels fully opaque for full-image analysis
+        r, g, b, a = original_rgba.split()
+        a = Image.new("L", original_rgba.size, 255)
+        original_full = Image.merge("RGBA", (r, g, b, a))
+        result["full_analysis"] = to_b64(make_redness_overlay(original_full))
+
+    return result
 
 def handler(job):
     job_input = job.get("input", {})
     image_b64 = job_input.get("image")
-    if not image_b64: return {"error": "Kein Bild."}
+    if not image_b64:
+        return {"error": "No image provided. Send base64 under input.image"}
+
+    skin_mask = job_input.get("skin_mask", True)
+
     try:
-        return process_image(image_b64)
+        return process_image(image_b64, skin_mask=skin_mask)
     except Exception as e:
         return {"error": str(e)}
 
