@@ -175,27 +175,50 @@ def process_single(image_b64: str, label: str) -> dict:
 
 
 def handler(job):
+    import traceback
     job_input = job.get("input", {})
     scan_id = job_input.get("scan_id")
     images = job_input.get("images")
+
+    print(f"[handler] scan_id={scan_id}")
+    print(f"[handler] images type={type(images)}, keys={list(images.keys()) if isinstance(images, dict) else 'N/A'}")
+    print(f"[handler] SUPABASE_URL set={bool(SUPABASE_URL)}, SERVICE_KEY set={bool(SUPABASE_SERVICE_KEY)}")
 
     if images and isinstance(images, dict):
         processed_angles = {}
         for key in ANGLE_KEYS:
             b64 = images.get(key)
             if b64:
+                print(f"[handler] Processing {key}, b64 length={len(b64)}")
                 try:
-                    processed_angles[key] = process_single(b64, key)
+                    result = process_single(b64, key)
+                    processed_angles[key] = result
+                    print(f"[handler] {key} OK — score={result.get('redness_score')}")
                 except Exception as e:
+                    print(f"[handler] {key} FAILED: {e}")
+                    traceback.print_exc()
                     processed_angles[key] = {"error": str(e)}
+            else:
+                print(f"[handler] {key} — no b64 data, skipping")
+
+        print(f"[handler] Processed angles: {list(processed_angles.keys())}")
 
         if scan_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
-            frontal = processed_angles.get("frontal", {})
-            update_supabase_scan(scan_id, processed_angles, frontal)
+            try:
+                frontal = processed_angles.get("frontal", {})
+                update_supabase_scan(scan_id, processed_angles, frontal)
+                print(f"[handler] DB updated OK for scan_id={scan_id}")
+            except Exception as e:
+                print(f"[handler] DB UPDATE FAILED: {e}")
+                traceback.print_exc()
+                raise  # Re-raise so RunPod marks the job FAILED (not COMPLETED)
             return {"status": "done", "scan_id": scan_id}
+        else:
+            print(f"[handler] Skipping DB update — scan_id={bool(scan_id)}, url={bool(SUPABASE_URL)}, key={bool(SUPABASE_SERVICE_KEY)}")
 
         return {"angles": processed_angles}
 
+    print(f"[handler] No images provided — images={images}")
     return {"error": "No images provided."}
 
 
