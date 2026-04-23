@@ -88,8 +88,8 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
 
 
 def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
-    """Grid-rectangle redness overlay on skin pixels only (hair excluded via brightness filter).
-    Returns (overlay RGBA image, score 0-100). Strictly blue/cyan palette."""
+    """Smooth Gaussian-blob redness overlay. Excludes hair (brightness) and ears (mask erosion).
+    Returns (overlay RGBA image, score 0-100). Neon cyan (40, 220, 255)."""
     clean_rgba = clean_rgba.convert("RGBA")
     rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
@@ -97,50 +97,51 @@ def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
 
     r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
     redness = r - (g + b) / 2.0
-    brightness = (r + g + b) / 3.0
+    # Perceptual brightness in [0, 1]
+    brightness = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
 
-    face_mask = alpha_arr > 0.3
-    # Exclude dark hair — hair pixels are typically brightness < 60
-    skin_mask = face_mask & (brightness > 60)
+    # Erode alpha mask to exclude ears and peripheral skin protrusions
+    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
+    erode_px = max(15, int(min(h, w) * 0.04))
+    kernel = np.ones((erode_px, erode_px), np.uint8)
+    eroded = cv2.erode(alpha_uint8, kernel, iterations=1)
+    inner_face = eroded > 100
+
+    # Combine: must be inner face AND not dark hair
+    skin_mask = inner_face & (brightness > 0.24)
 
     if not np.any(skin_mask):
         return Image.new("RGBA", (w, h), (0, 0, 0, 0)), 0
 
-    lo, hi = np.percentile(redness[skin_mask], [15, 95])
+    # Normalize redness on inner skin only — tight range highlights actual redness
+    lo, hi = np.percentile(redness[skin_mask], [60, 98])
     redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-    redness_n[~skin_mask] = 0.0
 
-    grid_cols, grid_rows = 32, 32
-    cell_w = w / grid_cols
-    cell_h = h / grid_rows
+    # Build smooth mask: redness × face alpha × brightness weight
+    mask = redness_n * alpha_arr
+    mask *= np.where(skin_mask, 1.0, 0.0)
+    mask *= np.clip((brightness - 0.15) / 0.85, 0.0, 1.0)
 
-    overlay = np.zeros((h, w, 4), dtype=np.uint8)
-    face_cells = 0
-    affected_cells = 0
-    threshold = 0.35
+    # Threshold: only genuinely elevated redness
+    mask = np.clip((mask - 0.25) / 0.75, 0.0, 1.0)
 
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
-            x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            if skin_mask[y0:y1, x0:x1].mean() < 0.15:
-                continue
-            face_cells += 1
-            cell_redness = redness_n[y0:y1, x0:x1].mean()
-            if cell_redness <= threshold:
-                continue
-            affected_cells += 1
-            t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
-            # Strictly blue/cyan: (0,180,255) at low t → (30,60,255) at high t
-            cr = int(0 + 30 * t)
-            cg = int(180 - 120 * t)
-            cb = 255
-            ca = int(100 + 130 * t)
-            pad = max(1, int(min(cell_w, cell_h) * 0.06))
-            overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
+    # Gaussian blur → smooth neon blobs (no hard edges)
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=6))
 
-    score = int((affected_cells / max(face_cells, 1)) * 100)
-    return Image.fromarray(overlay, mode="RGBA"), score
+    # Score: fraction of face pixels with visible overlay
+    mask_arr = np.array(mask_img) / 255.0
+    face_pixels = alpha_arr > 0.2
+    score = int((mask_arr[face_pixels] > 0.1).mean() * 100)
+
+    # Neon cyan — exact same colour as the reference best result
+    neon = np.zeros((h, w, 4), dtype=np.uint8)
+    neon[..., 0] = 40
+    neon[..., 1] = 220
+    neon[..., 2] = 255
+    neon[..., 3] = np.array(mask_img)
+
+    return Image.fromarray(neon, mode="RGBA"), score
 
 
 def apply_overlay(base_rgb: Image.Image, overlay_rgba: Image.Image) -> Image.Image:
