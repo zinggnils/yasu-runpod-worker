@@ -1,5 +1,8 @@
 import runpod
 import base64
+import os
+import uuid
+import requests
 from io import BytesIO
 from PIL import Image, ImageFilter
 import numpy as np
@@ -10,6 +13,10 @@ from rembg import new_session, remove
 print(f"ORT version: {ort.__version__}")
 print(f"Available providers: {ort.get_available_providers()}")
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = "scans"
+
 try:
     session = new_session("u2net", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
     print("Rembg session initialized with CUDA/CPU.")
@@ -17,10 +24,51 @@ except Exception as e:
     print(f"Failed to initialize GPU session, falling back: {e}")
     session = new_session("u2net")
 
+
+def upload_to_supabase(img: Image.Image, filename: str) -> str:
+    """Upload PIL image to Supabase Storage, return public URL."""
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    path = f"processed/{filename}"
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    resp = requests.put(url, data=buf.read(), headers={
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "image/png",
+        "x-upsert": "true",
+    })
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Storage upload failed: {resp.status_code} {resp.text[:200]}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+
+
+def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict):
+    """Write processed_angles back to the scans table."""
+    import json
+    url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
+    body = {
+        "status": "done",
+        "processed_angles": processed_angles,
+        "clean_image_url": frontal.get("clean_image_url"),
+        "redness_image_url": frontal.get("redness_image_url"),
+        "image_url": frontal.get("visia_image_url"),
+        "full_analysis_url": frontal.get("full_analysis_url"),
+    }
+    resp = requests.patch(url, json=body, headers={
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    })
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
+
+
 def to_b64(img_obj: Image.Image) -> str:
     buffered = BytesIO()
     img_obj.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
 
 def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
@@ -32,11 +80,8 @@ def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
     result.paste(rgb, mask=alpha)
     return result
 
+
 def make_redness_grid(clean_rgba: Image.Image) -> tuple:
-    """
-    32x32 grid overlay (1024 cells) coloured by redness intensity.
-    Returns (image, score_0_to_100).
-    """
     clean_rgba = clean_rgba.convert("RGBA")
     rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
@@ -65,42 +110,27 @@ def make_redness_grid(clean_rgba: Image.Image) -> tuple:
 
     for row in range(grid_rows):
         for col in range(grid_cols):
-            y0 = int(row * cell_h)
-            y1 = int((row + 1) * cell_h)
-            x0 = int(col * cell_w)
-            x1 = int((col + 1) * cell_w)
-
+            y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
+            x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
             cell_alpha = alpha_arr[y0:y1, x0:x1]
             if cell_alpha.mean() < 0.2:
                 continue
-
             face_cells += 1
             cell_redness = redness_n[y0:y1, x0:x1].mean()
-
             if cell_redness > threshold:
                 affected_cells += 1
                 t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
-                # Cyan-blue for low → orange-red for high
-                cr = int(30 + 225 * t)
-                cg = int(160 * (1 - t))
-                cb = int(255 * (1 - t * 0.85))
-                ca = int(100 + 130 * t)
+                cr = int(30 + 225 * t); cg = int(160 * (1 - t)); cb = int(255 * (1 - t * 0.85)); ca = int(100 + 130 * t)
                 pad = max(1, int(min(cell_w, cell_h) * 0.06))
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 0] = cr
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 1] = cg
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 2] = cb
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 3] = ca
+                overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
 
     score = int((affected_cells / max(face_cells, 1)) * 100)
     overlay_img = Image.fromarray(overlay, mode="RGBA")
     result = Image.alpha_composite(base, overlay_img).convert("RGB")
     return result, score
 
+
 def make_texture_grid(clean_rgba: Image.Image) -> tuple:
-    """
-    32x32 grid overlay coloured by texture (Laplacian variance) per cell.
-    Returns (image, score_0_to_100).
-    """
     clean_rgba = clean_rgba.convert("RGBA")
     rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
@@ -130,39 +160,27 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
 
     for row in range(grid_rows):
         for col in range(grid_cols):
-            y0 = int(row * cell_h)
-            y1 = int((row + 1) * cell_h)
-            x0 = int(col * cell_w)
-            x1 = int((col + 1) * cell_w)
-
+            y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
+            x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
             cell_alpha = alpha_arr[y0:y1, x0:x1]
             if cell_alpha.mean() < 0.2:
                 continue
-
             face_cells += 1
             cell_tex = texture_n[y0:y1, x0:x1].mean()
-
             if cell_tex > threshold:
                 affected_cells += 1
                 t = min(1.0, (cell_tex - threshold) / (1.0 - threshold))
-                # Green-teal for low → yellow-white for high (clinical texture look)
-                cr = int(100 * t)
-                cg = int(200 + 55 * t)
-                cb = int(180 * (1 - t * 0.7))
-                ca = int(90 + 140 * t)
+                cr = int(100 * t); cg = int(200 + 55 * t); cb = int(180 * (1 - t * 0.7)); ca = int(90 + 140 * t)
                 pad = max(1, int(min(cell_w, cell_h) * 0.06))
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 0] = cr
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 1] = cg
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 2] = cb
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad, 3] = ca
+                overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
 
     score = int((affected_cells / max(face_cells, 1)) * 100)
     overlay_img = Image.fromarray(overlay, mode="RGBA")
     result = Image.alpha_composite(base, overlay_img).convert("RGB")
     return result, score
 
+
 def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
-    """VISIA-style clinical duotone using CLAHE + COLORMAP_BONE."""
     clean_rgba = clean_rgba.convert("RGBA")
     alpha_arr = np.array(clean_rgba.split()[3])
     rgb_arr = np.array(clean_rgba.convert("RGB"))
@@ -174,17 +192,16 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
     duotone = Image.fromarray(bone_rgb, mode="RGB")
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
-    alpha_mask = Image.fromarray(alpha_arr, mode="L")
-    result.paste(duotone, mask=alpha_mask)
+    result.paste(duotone, mask=Image.fromarray(alpha_arr, mode="L"))
     return result
+
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 
-def process_single(image_b64: str) -> dict:
-    """Process one image: clean, redness grid + score, texture grid + score, visia, full_analysis."""
+
+def process_single(image_b64: str, label: str) -> dict:
     img_data = base64.b64decode(image_b64)
     original = Image.open(BytesIO(img_data)).convert("RGB")
-
     clean_rgba = remove(original, session=session).convert("RGBA")
 
     clean_img = on_black(clean_rgba, sharpen=True)
@@ -192,45 +209,59 @@ def process_single(image_b64: str) -> dict:
     texture_img, texture_score = make_texture_grid(clean_rgba)
     visia_img = make_visia_duotone(clean_rgba)
 
-    # Skin mask OFF: redness grid on full original (no bg removal)
     original_rgba = original.convert("RGBA")
     orig_r, orig_g, orig_b, _ = original_rgba.split()
     opaque_alpha = Image.new("L", original_rgba.size, 255)
     original_full = Image.merge("RGBA", (orig_r, orig_g, orig_b, opaque_alpha))
     full_analysis_img, _ = make_redness_grid(original_full)
 
+    uid = uuid.uuid4().hex[:8]
     return {
-        "clean_image": to_b64(clean_img),
-        "redness_image": to_b64(redness_img),
-        "texture_image": to_b64(texture_img),
-        "visia_image": to_b64(visia_img),
-        "full_analysis": to_b64(full_analysis_img),
-        "redness_score": redness_score,
-        "texture_score": texture_score,
+        "clean_image_url":    upload_to_supabase(clean_img,        f"clean_{label}_{uid}.png"),
+        "redness_image_url":  upload_to_supabase(redness_img,      f"redness_{label}_{uid}.png"),
+        "texture_image_url":  upload_to_supabase(texture_img,      f"texture_{label}_{uid}.png"),
+        "visia_image_url":    upload_to_supabase(visia_img,        f"visia_{label}_{uid}.png"),
+        "full_analysis_url":  upload_to_supabase(full_analysis_img,f"full_{label}_{uid}.png"),
+        "redness_score":  redness_score,
+        "texture_score":  texture_score,
     }
+
 
 def handler(job):
     job_input = job.get("input", {})
+    scan_id = job_input.get("scan_id")
 
     images = job_input.get("images")
     if images and isinstance(images, dict):
-        results = {}
+        processed_angles = {}
         for key in ANGLE_KEYS:
             b64 = images.get(key)
             if b64:
                 try:
-                    results[key] = process_single(b64)
+                    processed_angles[key] = process_single(b64, key)
                 except Exception as e:
-                    results[key] = {"error": str(e)}
-        return {"angles": results}
+                    processed_angles[key] = {"error": str(e)}
+
+        if scan_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            frontal = processed_angles.get("frontal", {})
+            update_supabase_scan(scan_id, processed_angles, frontal)
+            return {"status": "done", "scan_id": scan_id}
+
+        return {"angles": processed_angles}
 
     image_b64 = job_input.get("image")
     if not image_b64:
-        return {"error": "No image provided. Send base64 under input.image or input.images"}
-
+        return {"error": "No image provided."}
     try:
-        return process_single(image_b64)
+        buf = BytesIO()
+        img_data = base64.b64decode(image_b64)
+        original = Image.open(BytesIO(img_data)).convert("RGB")
+        clean_rgba = remove(original, session=session).convert("RGBA")
+        result_img = on_black(clean_rgba)
+        result_img.save(buf, format="PNG")
+        return {"image": base64.b64encode(buf.getvalue()).decode()}
     except Exception as e:
         return {"error": str(e)}
+
 
 runpod.serverless.start({"handler": handler})
