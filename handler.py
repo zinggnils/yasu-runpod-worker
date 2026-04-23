@@ -83,25 +83,30 @@ def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
 
 
 def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
-    """Returns (overlay PIL RGBA image, score 0-100) using dot scatter."""
+    """Returns (overlay PIL RGBA image, score 0-100).
+    Dots placed only where VISIA shows dark patches — these are the redness zones."""
     clean_rgba = clean_rgba.convert("RGBA")
-    rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
-    alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
+    alpha_arr = np.array(clean_rgba.split()[3]).astype(np.float32) / 255.0
+    h, w = alpha_arr.shape
 
-    h, w = rgb_arr.shape[:2]
+    # VISIA reveals redness as dark spots — use its luminance to guide dot placement
+    visia_img = make_visia_duotone(clean_rgba)
+    visia_lum = np.array(visia_img.convert("L")).astype(np.float32) / 255.0
+
+    face_mask = alpha_arr > 0.3
+    if not np.any(face_mask):
+        return Image.new("RGBA", (w, h), (0, 0, 0, 0)), 0
+
+    face_mean = visia_lum[face_mask].mean()
+    face_std  = visia_lum[face_mask].std()
+    # How many std-devs below mean — capped at 2 std, normalized to [0,1]
+    darkness = np.clip((face_mean - visia_lum) / (face_std * 2.0 + 1e-6), 0.0, 1.0)
+    darkness *= face_mask
+
     grid_cols, grid_rows = 32, 32
     cell_w = w / grid_cols
     cell_h = h / grid_rows
-
-    r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
-    redness = r - (g + b) / 2.0
-
-    face_mask = alpha_arr > 0.3
-    if np.any(face_mask):
-        lo, hi = np.percentile(redness[face_mask], [15, 95])
-        redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-    else:
-        redness_n = np.zeros_like(redness)
+    dot_r = max(2, int(min(cell_w, cell_h) * 0.22))
 
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -109,8 +114,8 @@ def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
 
     face_cells = 0
     affected_cells = 0
-    threshold = 0.35
-    dot_r = max(2, int(min(cell_w, cell_h) * 0.18))
+    # Only cells ≥ 0.5 std below mean get dots — keeps overlay sparse and targeted
+    threshold = 0.25
 
     for row in range(grid_rows):
         for col in range(grid_cols):
@@ -119,26 +124,24 @@ def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
             if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
                 continue
             face_cells += 1
-            cell_redness = redness_n[y0:y1, x0:x1].mean()
-            if cell_redness <= threshold:
+            cell_dark = darkness[y0:y1, x0:x1].mean()
+            if cell_dark <= threshold:
                 continue
             affected_cells += 1
-            t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
-            # cyan→blue at low t, shift toward red-violet at peak
-            cr = int(20 + 200 * t)
-            cg = int(180 * (1.0 - t * 0.85))
-            cb = int(240 - 40 * t)
-            ca = int(120 + 100 * t)
-            n_dots = max(1, int(1 + t * 5))
+            t = min(1.0, (cell_dark - threshold) / (1.0 - threshold))
+            # Strictly blue/cyan — no pink or red
+            cr = int(10 + 35 * t)
+            cg = int(155 * (1.0 - t * 0.55))
+            cb = 240
+            ca = int(140 + 90 * t)
+            n_dots = max(1, int(1 + t * 4))
             margin = dot_r + 1
             for _ in range(n_dots):
                 cx = rng.randint(x0 + margin, max(x0 + margin + 1, x1 - margin))
                 cy = rng.randint(y0 + margin, max(y0 + margin + 1, y1 - margin))
                 draw.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r], fill=(cr, cg, cb, ca))
 
-    # Soft blur to give the blob/glow look from reference
-    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=dot_r * 0.6))
-
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=dot_r * 0.5))
     score = int((affected_cells / max(face_cells, 1)) * 100)
     return overlay, score
 
@@ -170,7 +173,8 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
 
     face_mask = alpha_arr > 0.3
     if np.any(face_mask):
-        lo, hi = np.percentile(lap_abs[face_mask], [20, 95])
+        # Use top 45% of variance range — makes dots appear only on truly rough areas
+        lo, hi = np.percentile(lap_abs[face_mask], [55, 99])
         texture_n = np.clip((lap_abs - lo) / (hi - lo + 1e-6), 0.0, 1.0)
     else:
         texture_n = np.zeros_like(lap_abs)
@@ -183,7 +187,7 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
     face_cells = 0
     affected_cells = 0
     threshold = 0.35
-    dot_r = max(2, int(min(cell_w, cell_h) * 0.18))
+    dot_r = max(2, int(min(cell_w, cell_h) * 0.22))
 
     for row in range(grid_rows):
         for col in range(grid_cols):
