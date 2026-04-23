@@ -81,7 +81,8 @@ def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
     return result
 
 
-def make_redness_grid(clean_rgba: Image.Image) -> tuple:
+def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
+    """Returns (overlay PIL RGBA image, score 0-100)."""
     clean_rgba = clean_rgba.convert("RGBA")
     rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
@@ -101,9 +102,7 @@ def make_redness_grid(clean_rgba: Image.Image) -> tuple:
     else:
         redness_n = np.zeros_like(redness)
 
-    base = on_black(clean_rgba, sharpen=True).convert("RGBA")
     overlay = np.zeros((h, w, 4), dtype=np.uint8)
-
     face_cells = 0
     affected_cells = 0
     threshold = 0.35
@@ -125,9 +124,18 @@ def make_redness_grid(clean_rgba: Image.Image) -> tuple:
                 overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
 
     score = int((affected_cells / max(face_cells, 1)) * 100)
-    overlay_img = Image.fromarray(overlay, mode="RGBA")
-    result = Image.alpha_composite(base, overlay_img).convert("RGB")
-    return result, score
+    return Image.fromarray(overlay, mode="RGBA"), score
+
+
+def apply_overlay(base_rgb: Image.Image, overlay_rgba: Image.Image) -> Image.Image:
+    base = base_rgb.convert("RGBA")
+    return Image.alpha_composite(base, overlay_rgba).convert("RGB")
+
+
+def make_redness_grid(clean_rgba: Image.Image) -> tuple:
+    overlay, score = compute_redness_overlay(clean_rgba)
+    base = on_black(clean_rgba, sharpen=True)
+    return apply_overlay(base, overlay), score
 
 
 def make_texture_grid(clean_rgba: Image.Image) -> tuple:
@@ -209,8 +217,8 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     visia_img = make_visia_duotone(clean_rgba)
 
     result = {
-        "clean_image_url": upload_to_supabase(clean_img,  f"clean_{label}_{uid}.png"),
-        "visia_image_url": upload_to_supabase(visia_img,  f"visia_{label}_{uid}.png"),
+        "clean_image_url": upload_to_supabase(clean_img, f"clean_{label}_{uid}.png"),
+        "visia_image_url": upload_to_supabase(visia_img, f"visia_{label}_{uid}.png"),
     }
 
     if mode == "texture":
@@ -218,8 +226,12 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
         result["texture_image_url"] = upload_to_supabase(texture_img, f"texture_{label}_{uid}.png")
         result["texture_score"] = texture_score
     else:
-        redness_img, redness_score = make_redness_grid(clean_rgba)
-        result["redness_image_url"] = upload_to_supabase(redness_img, f"redness_{label}_{uid}.png")
+        # Compute overlay once, apply to both clean and VISIA
+        overlay, redness_score = compute_redness_overlay(clean_rgba)
+        redness_on_clean = apply_overlay(clean_img, overlay)
+        redness_on_visia = apply_overlay(visia_img, overlay)
+        result["redness_image_url"]       = upload_to_supabase(redness_on_clean, f"redness_{label}_{uid}.png")
+        result["redness_visia_image_url"] = upload_to_supabase(redness_on_visia, f"redness_visia_{label}_{uid}.png")
         result["redness_score"] = redness_score
 
     return result
