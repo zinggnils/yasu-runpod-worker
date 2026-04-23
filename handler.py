@@ -107,32 +107,39 @@ def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
     eroded = cv2.erode(alpha_uint8, kernel, iterations=1)
     inner_face = eroded > 100
 
-    # Combine: must be inner face AND not dark hair
-    skin_mask = inner_face & (brightness > 0.24)
+    # Lowered brightness threshold (0.18) to better handle darker/olive skin tones
+    skin_mask = inner_face & (brightness > 0.18)
 
     if not np.any(skin_mask):
         return Image.new("RGBA", (w, h), (0, 0, 0, 0)), 0
 
     # Normalize redness on inner skin only — tight range highlights actual redness
-    lo, hi = np.percentile(redness[skin_mask], [60, 98])
+    lo, hi = np.percentile(redness[skin_mask], [55, 97])
     redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
 
-    # Build smooth mask: redness × face alpha × brightness weight
+    # Score computed from RAW redness signal BEFORE visualization blur — accurate, blur-independent
+    # Uses mean of top-25% most-red skin pixels to reflect peak redness severity
+    face_skin = skin_mask & (alpha_arr > 0.2)
+    if np.any(face_skin):
+        rn_face = redness_n[face_skin]
+        p75 = np.percentile(rn_face, 75)
+        top25_mean = float(rn_face[rn_face >= max(p75, 0.01)].mean())
+        # Scale: 0.2 raw → ~20 score (mild), 0.5 raw → ~50 (moderate), 0.8+ → ~80+ (severe)
+        score = int(min(100, top25_mean * 100))
+    else:
+        score = 0
+
+    # Build smooth mask for visualization: redness × face alpha × brightness weight
     mask = redness_n * alpha_arr
     mask *= np.where(skin_mask, 1.0, 0.0)
-    mask *= np.clip((brightness - 0.15) / 0.85, 0.0, 1.0)
+    mask *= np.clip((brightness - 0.12) / 0.88, 0.0, 1.0)
 
-    # Threshold: only genuinely elevated redness
-    mask = np.clip((mask - 0.25) / 0.75, 0.0, 1.0)
+    # Softer threshold (0.10 → more of the redness area covered, clinically realistic)
+    mask = np.clip((mask - 0.10) / 0.90, 0.0, 1.0)
 
     # Gaussian blur → smooth neon blobs (no hard edges)
     mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=6))
-
-    # Score: fraction of face pixels with visible overlay
-    mask_arr = np.array(mask_img) / 255.0
-    face_pixels = alpha_arr > 0.2
-    score = int((mask_arr[face_pixels] > 0.1).mean() * 100)
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=8))
 
     # Neon cyan — exact same colour as the reference best result
     neon = np.zeros((h, w, 4), dtype=np.uint8)
