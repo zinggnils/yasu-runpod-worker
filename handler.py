@@ -2,9 +2,10 @@ import runpod
 import base64
 import os
 import uuid
+import random
 import requests
 from io import BytesIO
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw
 import numpy as np
 import cv2
 import onnxruntime as ort
@@ -81,7 +82,8 @@ def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
     return result
 
 
-def make_redness_grid(clean_rgba: Image.Image) -> tuple:
+def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
+    """Returns (overlay PIL RGBA image, score 0-100) using dot scatter."""
     clean_rgba = clean_rgba.convert("RGBA")
     rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
@@ -101,33 +103,55 @@ def make_redness_grid(clean_rgba: Image.Image) -> tuple:
     else:
         redness_n = np.zeros_like(redness)
 
-    base = on_black(clean_rgba, sharpen=True).convert("RGBA")
-    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    rng = random.Random(42)
 
     face_cells = 0
     affected_cells = 0
     threshold = 0.35
+    dot_r = max(2, int(min(cell_w, cell_h) * 0.18))
 
     for row in range(grid_rows):
         for col in range(grid_cols):
             y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
             x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            cell_alpha = alpha_arr[y0:y1, x0:x1]
-            if cell_alpha.mean() < 0.2:
+            if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
                 continue
             face_cells += 1
             cell_redness = redness_n[y0:y1, x0:x1].mean()
-            if cell_redness > threshold:
-                affected_cells += 1
-                t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
-                cr = int(30 + 225 * t); cg = int(160 * (1 - t)); cb = int(255 * (1 - t * 0.85)); ca = int(100 + 130 * t)
-                pad = max(1, int(min(cell_w, cell_h) * 0.06))
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
+            if cell_redness <= threshold:
+                continue
+            affected_cells += 1
+            t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
+            # cyan→blue at low t, shift toward red-violet at peak
+            cr = int(20 + 200 * t)
+            cg = int(180 * (1.0 - t * 0.85))
+            cb = int(240 - 40 * t)
+            ca = int(120 + 100 * t)
+            n_dots = max(1, int(1 + t * 5))
+            margin = dot_r + 1
+            for _ in range(n_dots):
+                cx = rng.randint(x0 + margin, max(x0 + margin + 1, x1 - margin))
+                cy = rng.randint(y0 + margin, max(y0 + margin + 1, y1 - margin))
+                draw.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r], fill=(cr, cg, cb, ca))
+
+    # Soft blur to give the blob/glow look from reference
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=dot_r * 0.6))
 
     score = int((affected_cells / max(face_cells, 1)) * 100)
-    overlay_img = Image.fromarray(overlay, mode="RGBA")
-    result = Image.alpha_composite(base, overlay_img).convert("RGB")
-    return result, score
+    return overlay, score
+
+
+def apply_overlay(base_rgb: Image.Image, overlay_rgba: Image.Image) -> Image.Image:
+    base = base_rgb.convert("RGBA")
+    return Image.alpha_composite(base, overlay_rgba).convert("RGB")
+
+
+def make_redness_grid(clean_rgba: Image.Image) -> tuple:
+    overlay, score = compute_redness_overlay(clean_rgba)
+    base = on_black(clean_rgba, sharpen=True)
+    return apply_overlay(base, overlay), score
 
 
 def make_texture_grid(clean_rgba: Image.Image) -> tuple:
@@ -151,32 +175,44 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
     else:
         texture_n = np.zeros_like(lap_abs)
 
-    base = on_black(clean_rgba, sharpen=True).convert("RGBA")
-    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    base = on_black(clean_rgba, sharpen=True)
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    rng = random.Random(42)
 
     face_cells = 0
     affected_cells = 0
     threshold = 0.35
+    dot_r = max(2, int(min(cell_w, cell_h) * 0.18))
 
     for row in range(grid_rows):
         for col in range(grid_cols):
             y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
             x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            cell_alpha = alpha_arr[y0:y1, x0:x1]
-            if cell_alpha.mean() < 0.2:
+            if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
                 continue
             face_cells += 1
             cell_tex = texture_n[y0:y1, x0:x1].mean()
-            if cell_tex > threshold:
-                affected_cells += 1
-                t = min(1.0, (cell_tex - threshold) / (1.0 - threshold))
-                cr = int(100 * t); cg = int(200 + 55 * t); cb = int(180 * (1 - t * 0.7)); ca = int(90 + 140 * t)
-                pad = max(1, int(min(cell_w, cell_h) * 0.06))
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
+            if cell_tex <= threshold:
+                continue
+            affected_cells += 1
+            t = min(1.0, (cell_tex - threshold) / (1.0 - threshold))
+            # orange/gold palette
+            cr = int(220 + 35 * t)
+            cg = int(140 + 60 * (1.0 - t * 0.5))
+            cb = int(20 * (1.0 - t))
+            ca = int(110 + 120 * t)
+            n_dots = max(1, int(1 + t * 5))
+            margin = dot_r + 1
+            for _ in range(n_dots):
+                cx = rng.randint(x0 + margin, max(x0 + margin + 1, x1 - margin))
+                cy = rng.randint(y0 + margin, max(y0 + margin + 1, y1 - margin))
+                r_var = max(1, dot_r + rng.randint(-1, 1))
+                draw.ellipse([cx - r_var, cy - r_var, cx + r_var, cy + r_var], fill=(cr, cg, cb, ca))
 
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=dot_r * 0.5))
     score = int((affected_cells / max(face_cells, 1)) * 100)
-    overlay_img = Image.fromarray(overlay, mode="RGBA")
-    result = Image.alpha_composite(base, overlay_img).convert("RGB")
+    result = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
     return result, score
 
 
@@ -199,38 +235,41 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 
 
-def process_single(image_b64: str, label: str) -> dict:
+def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data = base64.b64decode(image_b64)
     original = Image.open(BytesIO(img_data)).convert("RGB")
     clean_rgba = remove(original, session=session).convert("RGBA")
+    uid = uuid.uuid4().hex[:8]
 
     clean_img = on_black(clean_rgba, sharpen=True)
-    redness_img, redness_score = make_redness_grid(clean_rgba)
-    texture_img, texture_score = make_texture_grid(clean_rgba)
     visia_img = make_visia_duotone(clean_rgba)
 
-    original_rgba = original.convert("RGBA")
-    orig_r, orig_g, orig_b, _ = original_rgba.split()
-    opaque_alpha = Image.new("L", original_rgba.size, 255)
-    original_full = Image.merge("RGBA", (orig_r, orig_g, orig_b, opaque_alpha))
-    full_analysis_img, _ = make_redness_grid(original_full)
-
-    uid = uuid.uuid4().hex[:8]
-    return {
-        "clean_image_url":    upload_to_supabase(clean_img,        f"clean_{label}_{uid}.png"),
-        "redness_image_url":  upload_to_supabase(redness_img,      f"redness_{label}_{uid}.png"),
-        "texture_image_url":  upload_to_supabase(texture_img,      f"texture_{label}_{uid}.png"),
-        "visia_image_url":    upload_to_supabase(visia_img,        f"visia_{label}_{uid}.png"),
-        "full_analysis_url":  upload_to_supabase(full_analysis_img,f"full_{label}_{uid}.png"),
-        "redness_score":  redness_score,
-        "texture_score":  texture_score,
+    result = {
+        "clean_image_url": upload_to_supabase(clean_img, f"clean_{label}_{uid}.png"),
+        "visia_image_url": upload_to_supabase(visia_img, f"visia_{label}_{uid}.png"),
     }
+
+    if mode == "texture":
+        texture_img, texture_score = make_texture_grid(clean_rgba)
+        result["texture_image_url"] = upload_to_supabase(texture_img, f"texture_{label}_{uid}.png")
+        result["texture_score"] = texture_score
+    else:
+        # Compute overlay once, apply to both clean and VISIA
+        overlay, redness_score = compute_redness_overlay(clean_rgba)
+        redness_on_clean = apply_overlay(clean_img, overlay)
+        redness_on_visia = apply_overlay(visia_img, overlay)
+        result["redness_image_url"]       = upload_to_supabase(redness_on_clean, f"redness_{label}_{uid}.png")
+        result["redness_visia_image_url"] = upload_to_supabase(redness_on_visia, f"redness_visia_{label}_{uid}.png")
+        result["redness_score"] = redness_score
+
+    return result
 
 
 def handler(job):
     job_input = job.get("input", {})
     scan_id = job_input.get("scan_id")
 
+    mode = job_input.get("mode", "redness")
     images = job_input.get("images")
     if images and isinstance(images, dict):
         processed_angles = {}
@@ -238,7 +277,7 @@ def handler(job):
             b64 = images.get(key)
             if b64:
                 try:
-                    processed_angles[key] = process_single(b64, key)
+                    processed_angles[key] = process_single(b64, key, mode)
                 except Exception as e:
                     processed_angles[key] = {"error": str(e)}
 
