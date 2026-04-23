@@ -84,24 +84,27 @@ def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
 
 def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
     """Returns (overlay PIL RGBA image, score 0-100).
-    Dots placed only where VISIA shows dark patches — these are the redness zones."""
+    RGB redness (R - avg(G,B)) on skin pixels only — dark hair excluded by brightness filter."""
     clean_rgba = clean_rgba.convert("RGBA")
-    alpha_arr = np.array(clean_rgba.split()[3]).astype(np.float32) / 255.0
+    rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
+    alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    # VISIA reveals redness as dark spots — use its luminance to guide dot placement
-    visia_img = make_visia_duotone(clean_rgba)
-    visia_lum = np.array(visia_img.convert("L")).astype(np.float32) / 255.0
+    r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
+    redness = r - (g + b) / 2.0
+    brightness = (r + g + b) / 3.0
 
     face_mask = alpha_arr > 0.3
-    if not np.any(face_mask):
+    # Skin mask: exclude dark hair (hair brightness typically < 60/255)
+    skin_mask = face_mask & (brightness > 60)
+
+    if not np.any(skin_mask):
         return Image.new("RGBA", (w, h), (0, 0, 0, 0)), 0
 
-    face_mean = visia_lum[face_mask].mean()
-    face_std  = visia_lum[face_mask].std()
-    # How many std-devs below mean — capped at 2 std, normalized to [0,1]
-    darkness = np.clip((face_mean - visia_lum) / (face_std * 2.0 + 1e-6), 0.0, 1.0)
-    darkness *= face_mask
+    # Normalize redness relative to skin pixels only, tight percentile range
+    lo, hi = np.percentile(redness[skin_mask], [40, 98])
+    redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+    redness_n[~skin_mask] = 0.0
 
     grid_cols, grid_rows = 32, 32
     cell_w = w / grid_cols
@@ -114,26 +117,26 @@ def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
 
     face_cells = 0
     affected_cells = 0
-    # Only cells ≥ 0.5 std below mean get dots — keeps overlay sparse and targeted
-    threshold = 0.25
+    threshold = 0.45  # only genuinely above-average redness gets dots
 
     for row in range(grid_rows):
         for col in range(grid_cols):
             y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
             x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
+            # Skip cells that are mostly hair/background
+            if skin_mask[y0:y1, x0:x1].mean() < 0.15:
                 continue
             face_cells += 1
-            cell_dark = darkness[y0:y1, x0:x1].mean()
-            if cell_dark <= threshold:
+            cell_redness = redness_n[y0:y1, x0:x1].mean()
+            if cell_redness <= threshold:
                 continue
             affected_cells += 1
-            t = min(1.0, (cell_dark - threshold) / (1.0 - threshold))
-            # Strictly blue/cyan — no pink or red
+            t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
+            # Neon blue/cyan — never pink or red
             cr = int(10 + 35 * t)
-            cg = int(155 * (1.0 - t * 0.55))
-            cb = 240
-            ca = int(140 + 90 * t)
+            cg = int(200 * (1.0 - t * 0.6))
+            cb = 255
+            ca = int(150 + 80 * t)
             n_dots = max(1, int(1 + t * 4))
             margin = dot_r + 1
             for _ in range(n_dots):
@@ -172,10 +175,12 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
     lap_abs = np.abs(lap)
 
     face_mask = alpha_arr > 0.3
-    if np.any(face_mask):
-        # Use top 45% of variance range — makes dots appear only on truly rough areas
-        lo, hi = np.percentile(lap_abs[face_mask], [55, 99])
+    brightness = rgb_arr.mean(axis=2)
+    skin_mask = face_mask & (brightness > 60)  # exclude dark hair
+    if np.any(skin_mask):
+        lo, hi = np.percentile(lap_abs[skin_mask], [55, 99])
         texture_n = np.clip((lap_abs - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+        texture_n[~skin_mask] = 0.0
     else:
         texture_n = np.zeros_like(lap_abs)
 
@@ -193,7 +198,7 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
         for col in range(grid_cols):
             y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
             x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
+            if skin_mask[y0:y1, x0:x1].mean() < 0.15:
                 continue
             face_cells += 1
             cell_tex = texture_n[y0:y1, x0:x1].mean()
