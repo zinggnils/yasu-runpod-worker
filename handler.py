@@ -2,9 +2,10 @@ import runpod
 import base64
 import os
 import uuid
+import random
 import requests
 from io import BytesIO
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw
 import numpy as np
 import cv2
 import onnxruntime as ort
@@ -82,7 +83,7 @@ def on_black(clean_rgba: Image.Image, sharpen: bool = True) -> Image.Image:
 
 
 def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
-    """Returns (overlay PIL RGBA image, score 0-100)."""
+    """Returns (overlay PIL RGBA image, score 0-100) using dot scatter."""
     clean_rgba = clean_rgba.convert("RGBA")
     rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
@@ -102,29 +103,44 @@ def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
     else:
         redness_n = np.zeros_like(redness)
 
-    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    rng = random.Random(42)
+
     face_cells = 0
     affected_cells = 0
     threshold = 0.35
+    dot_r = max(2, int(min(cell_w, cell_h) * 0.18))
 
     for row in range(grid_rows):
         for col in range(grid_cols):
             y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
             x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            cell_alpha = alpha_arr[y0:y1, x0:x1]
-            if cell_alpha.mean() < 0.2:
+            if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
                 continue
             face_cells += 1
             cell_redness = redness_n[y0:y1, x0:x1].mean()
-            if cell_redness > threshold:
-                affected_cells += 1
-                t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
-                cr = int(30 + 225 * t); cg = int(160 * (1 - t)); cb = int(255 * (1 - t * 0.85)); ca = int(100 + 130 * t)
-                pad = max(1, int(min(cell_w, cell_h) * 0.06))
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
+            if cell_redness <= threshold:
+                continue
+            affected_cells += 1
+            t = min(1.0, (cell_redness - threshold) / (1.0 - threshold))
+            # cyan→blue at low t, shift toward red-violet at peak
+            cr = int(20 + 200 * t)
+            cg = int(180 * (1.0 - t * 0.85))
+            cb = int(240 - 40 * t)
+            ca = int(120 + 100 * t)
+            n_dots = max(1, int(1 + t * 5))
+            margin = dot_r + 1
+            for _ in range(n_dots):
+                cx = rng.randint(x0 + margin, max(x0 + margin + 1, x1 - margin))
+                cy = rng.randint(y0 + margin, max(y0 + margin + 1, y1 - margin))
+                draw.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r], fill=(cr, cg, cb, ca))
+
+    # Soft blur to give the blob/glow look from reference
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=dot_r * 0.6))
 
     score = int((affected_cells / max(face_cells, 1)) * 100)
-    return Image.fromarray(overlay, mode="RGBA"), score
+    return overlay, score
 
 
 def apply_overlay(base_rgb: Image.Image, overlay_rgba: Image.Image) -> Image.Image:
@@ -159,32 +175,44 @@ def make_texture_grid(clean_rgba: Image.Image) -> tuple:
     else:
         texture_n = np.zeros_like(lap_abs)
 
-    base = on_black(clean_rgba, sharpen=True).convert("RGBA")
-    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    base = on_black(clean_rgba, sharpen=True)
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    rng = random.Random(42)
 
     face_cells = 0
     affected_cells = 0
     threshold = 0.35
+    dot_r = max(2, int(min(cell_w, cell_h) * 0.18))
 
     for row in range(grid_rows):
         for col in range(grid_cols):
             y0 = int(row * cell_h); y1 = int((row + 1) * cell_h)
             x0 = int(col * cell_w); x1 = int((col + 1) * cell_w)
-            cell_alpha = alpha_arr[y0:y1, x0:x1]
-            if cell_alpha.mean() < 0.2:
+            if alpha_arr[y0:y1, x0:x1].mean() < 0.2:
                 continue
             face_cells += 1
             cell_tex = texture_n[y0:y1, x0:x1].mean()
-            if cell_tex > threshold:
-                affected_cells += 1
-                t = min(1.0, (cell_tex - threshold) / (1.0 - threshold))
-                cr = int(100 * t); cg = int(200 + 55 * t); cb = int(180 * (1 - t * 0.7)); ca = int(90 + 140 * t)
-                pad = max(1, int(min(cell_w, cell_h) * 0.06))
-                overlay[y0+pad:y1-pad, x0+pad:x1-pad] = [cr, cg, cb, ca]
+            if cell_tex <= threshold:
+                continue
+            affected_cells += 1
+            t = min(1.0, (cell_tex - threshold) / (1.0 - threshold))
+            # orange/gold palette
+            cr = int(220 + 35 * t)
+            cg = int(140 + 60 * (1.0 - t * 0.5))
+            cb = int(20 * (1.0 - t))
+            ca = int(110 + 120 * t)
+            n_dots = max(1, int(1 + t * 5))
+            margin = dot_r + 1
+            for _ in range(n_dots):
+                cx = rng.randint(x0 + margin, max(x0 + margin + 1, x1 - margin))
+                cy = rng.randint(y0 + margin, max(y0 + margin + 1, y1 - margin))
+                r_var = max(1, dot_r + rng.randint(-1, 1))
+                draw.ellipse([cx - r_var, cy - r_var, cx + r_var, cy + r_var], fill=(cr, cg, cb, ca))
 
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=dot_r * 0.5))
     score = int((affected_cells / max(face_cells, 1)) * 100)
-    overlay_img = Image.fromarray(overlay, mode="RGBA")
-    result = Image.alpha_composite(base, overlay_img).convert("RGB")
+    result = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
     return result, score
 
 
