@@ -199,38 +199,37 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 
 
-def process_single(image_b64: str, label: str) -> dict:
+def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data = base64.b64decode(image_b64)
     original = Image.open(BytesIO(img_data)).convert("RGB")
     clean_rgba = remove(original, session=session).convert("RGBA")
+    uid = uuid.uuid4().hex[:8]
 
     clean_img = on_black(clean_rgba, sharpen=True)
-    redness_img, redness_score = make_redness_grid(clean_rgba)
-    texture_img, texture_score = make_texture_grid(clean_rgba)
     visia_img = make_visia_duotone(clean_rgba)
 
-    original_rgba = original.convert("RGBA")
-    orig_r, orig_g, orig_b, _ = original_rgba.split()
-    opaque_alpha = Image.new("L", original_rgba.size, 255)
-    original_full = Image.merge("RGBA", (orig_r, orig_g, orig_b, opaque_alpha))
-    full_analysis_img, _ = make_redness_grid(original_full)
-
-    uid = uuid.uuid4().hex[:8]
-    return {
-        "clean_image_url":    upload_to_supabase(clean_img,        f"clean_{label}_{uid}.png"),
-        "redness_image_url":  upload_to_supabase(redness_img,      f"redness_{label}_{uid}.png"),
-        "texture_image_url":  upload_to_supabase(texture_img,      f"texture_{label}_{uid}.png"),
-        "visia_image_url":    upload_to_supabase(visia_img,        f"visia_{label}_{uid}.png"),
-        "full_analysis_url":  upload_to_supabase(full_analysis_img,f"full_{label}_{uid}.png"),
-        "redness_score":  redness_score,
-        "texture_score":  texture_score,
+    result = {
+        "clean_image_url": upload_to_supabase(clean_img,  f"clean_{label}_{uid}.png"),
+        "visia_image_url": upload_to_supabase(visia_img,  f"visia_{label}_{uid}.png"),
     }
+
+    if mode == "texture":
+        texture_img, texture_score = make_texture_grid(clean_rgba)
+        result["texture_image_url"] = upload_to_supabase(texture_img, f"texture_{label}_{uid}.png")
+        result["texture_score"] = texture_score
+    else:
+        redness_img, redness_score = make_redness_grid(clean_rgba)
+        result["redness_image_url"] = upload_to_supabase(redness_img, f"redness_{label}_{uid}.png")
+        result["redness_score"] = redness_score
+
+    return result
 
 
 def handler(job):
     job_input = job.get("input", {})
     scan_id = job_input.get("scan_id")
 
+    mode = job_input.get("mode", "redness")
     images = job_input.get("images")
     if images and isinstance(images, dict):
         processed_angles = {}
@@ -238,7 +237,7 @@ def handler(job):
             b64 = images.get(key)
             if b64:
                 try:
-                    processed_angles[key] = process_single(b64, key)
+                    processed_angles[key] = process_single(b64, key, mode)
                 except Exception as e:
                     processed_angles[key] = {"error": str(e)}
 
