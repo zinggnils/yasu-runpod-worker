@@ -2,5 +2,6 @@ numpy==1.26.4
 runpod
 pillow
 rembg
+pymatting
 onnxruntime-gpu==1.17.1
 opencv-python-headless

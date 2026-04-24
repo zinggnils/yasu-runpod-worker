@@ -102,8 +102,20 @@ def on_black(clean_rgba: Image.Image) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
     alpha = clean_rgba.split()[3]
     rgb = clean_rgba.convert("RGB")
-    # Strong sharpening for crisp clinical output — tuned for full-resolution phone photos
-    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=180, threshold=1))
+
+    # ── Step 1: Clarity pass (large-radius high-pass) ──
+    # Replicates Adobe Express / Lightroom "Clarity" — lifts midtone contrast,
+    # makes skin texture, pores and fine detail visually pop without over-sharpening edges.
+    arr = np.array(rgb).astype(np.float32)
+    blur_large = cv2.GaussianBlur(arr, (0, 0), sigmaX=30)
+    # strength=0.45 ≈ Lightroom Clarity +40 / Adobe Express texture boost
+    arr_clarity = np.clip(arr + (arr - blur_large) * 0.45, 0, 255).astype(np.uint8)
+    rgb = Image.fromarray(arr_clarity)
+
+    # ── Step 2: Fine sharpening pass ──
+    # Crispens edges and fine lines — radius=1.5, percent=220 ≈ Adobe Express Sharpen +25
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=220, threshold=1))
+
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(rgb, mask=alpha)
     return result
@@ -117,9 +129,17 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(gray)
-    bone = cv2.applyColorMap(contrast, cv2.COLORMAP_BONE)
+
+    # Clarity pass on the grayscale before colormap — lifts skin texture in VISIA view
+    contrast_f = contrast.astype(np.float32)
+    blur_large = cv2.GaussianBlur(contrast_f, (0, 0), sigmaX=30)
+    contrast_clarity = np.clip(contrast_f + (contrast_f - blur_large) * 0.40, 0, 255).astype(np.uint8)
+
+    bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
     bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
     duotone = Image.fromarray(bone_rgb, mode="RGB")
+    # Fine sharpening pass
+    duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.5, percent=200, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(duotone, mask=Image.fromarray(alpha_arr, mode="L"))
     return result
@@ -197,104 +217,26 @@ def apply_overlay(base_rgb: Image.Image, overlay_rgba: Image.Image) -> Image.Ima
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 
 
-def compute_texture_spots(clean_rgba: Image.Image) -> Image.Image:
-    """Locate 5-15 strongest texture problem spots and mark them with yellow circles.
-
-    Algorithm:
-    1. Generate 'ideal smooth skin' reference via bilateral filter (AI proxy — not saved)
-    2. Diff = |original_gray - smooth_reference| → highlights texture irregularities
-    3. Combine with high-frequency Laplacian for fine pore detail
-    4. Apply face skin mask (exclude hair + ears via erosion)
-    5. Non-maximum suppression → pick top 5-15 distinct spots
-    6. Draw yellow circles on clean RGB image
-    """
-    clean_rgba = clean_rgba.convert("RGBA")
-    rgb_arr  = np.array(clean_rgba.convert("RGB"))
-    alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
-    h, w = alpha_arr.shape
-
-    # ── Face skin mask (exclude ears + hair) ──
-    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
-    erode_px = max(20, int(min(h, w) * 0.05))
-    kernel = np.ones((erode_px, erode_px), np.uint8)
-    eroded = cv2.erode(alpha_uint8, kernel, iterations=1)
-    inner_face = eroded > 100
-
-    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
-                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
-                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
-    skin_mask = inner_face & (brightness > 0.18)
-
-    gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
-
-    # ── "AI better skin" reference: bilateral filter (smooths skin, preserves edges) ──
-    # This reference is computed in memory only — never uploaded/saved
-    smooth_ref = cv2.bilateralFilter(gray.astype(np.uint8), 25, 80, 80).astype(np.float32)
-
-    # ── Texture problem map ──
-    diff      = np.abs(gray - smooth_ref)                              # macro roughness
-    laplacian = np.abs(cv2.Laplacian(gray.astype(np.uint8), cv2.CV_32F))  # fine pores
-    texture_map = diff * 0.55 + laplacian * 0.45
-    texture_map[~skin_mask] = 0.0
-
-    if texture_map.max() < 1e-6:
-        # No texture detected — return clean image unchanged
-        return clean_rgba.convert("RGB")
-
-    texture_map /= texture_map.max()
-
-    # ── Non-maximum suppression: pick top 5-15 spots ──
-    min_dist = max(18, int(min(h, w) * 0.04))   # minimum pixels between spots
-    spots = []
-    temp   = texture_map.copy()
-
-    for _ in range(15):
-        yx = np.unravel_index(np.argmax(temp), temp.shape)
-        val = temp[yx]
-        if val < 0.08:   # stop if remaining peaks are too weak
-            break
-        y, x = yx
-        spots.append((x, y, float(val)))
-        # Suppress neighbourhood
-        y1, y2 = max(0, y - min_dist), min(h, y + min_dist)
-        x1, x2 = max(0, x - min_dist), min(w, x + min_dist)
-        temp[y1:y2, x1:x2] = 0.0
-
-    # Ensure at least 5 if the skin area is large enough
-    if len(spots) < 5 and np.any(skin_mask):
-        min_dist2 = max(10, min_dist // 2)
-        for _ in range(5 - len(spots)):
-            yx = np.unravel_index(np.argmax(temp), temp.shape)
-            val = temp[yx]
-            if val < 0.02:
-                break
-            y, x = yx
-            spots.append((x, y, float(val)))
-            y1, y2 = max(0, y - min_dist2), min(h, y + min_dist2)
-            x1, x2 = max(0, x - min_dist2), min(w, x + min_dist2)
-            temp[y1:y2, x1:x2] = 0.0
-
-    print(f"[texture] Found {len(spots)} spots")
-
-    # ── Draw yellow markers on clean RGB image ──
-    result = np.array(clean_rgba.convert("RGB")).copy()
-    YELLOW = (255, 210, 0)
-
-    for x, y, strength in spots:
-        outer_r = int(10 + strength * 14)   # 10–24 px depending on severity
-        inner_r = max(3, outer_r // 4)
-        cv2.circle(result, (x, y), outer_r, YELLOW, 2, lineType=cv2.LINE_AA)
-        cv2.circle(result, (x, y), inner_r, YELLOW, -1, lineType=cv2.LINE_AA)
-
-    return Image.fromarray(result, mode="RGB")
-
-
 def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = Image.open(BytesIO(img_data)).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
-    clean_rgba = remove(original, session=session).convert("RGBA")
-    # Refine rembg's upsampled mask edges with guided filter — fixes fringing at full resolution
+    # alpha_matting=True: trimap-based matting preserves fine hair strands u2net would clip.
+    # Falls back to standard removal if pymatting is unavailable.
+    try:
+        clean_rgba = remove(
+            original,
+            session=session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10,
+        ).convert("RGBA")
+        print("[process_single] Alpha matting OK")
+    except Exception as e:
+        print(f"[process_single] Alpha matting failed ({e}), falling back to standard removal")
+        clean_rgba = remove(original, session=session).convert("RGBA")
+    # Guided filter: snaps soft matting edges to actual image boundaries (fixes fringing)
     clean_rgba = refine_alpha(original, clean_rgba)
     uid = uuid.uuid4().hex[:8]
 
