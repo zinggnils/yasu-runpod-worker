@@ -191,6 +191,14 @@ def handler(job):
     print(f"[handler] images type={type(images)}, keys={list(images.keys()) if isinstance(images, dict) else 'N/A'}")
     print(f"[handler] SUPABASE_URL set={bool(SUPABASE_URL)}, SERVICE_KEY set={bool(SUPABASE_SERVICE_KEY)}")
 
+    # Fail immediately if env vars missing — worker started without config, no point processing
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise RuntimeError(
+            f"MISSING ENV VARS: SUPABASE_URL={'SET' if SUPABASE_URL else 'EMPTY'}, "
+            f"SUPABASE_SERVICE_KEY={'SET' if SUPABASE_SERVICE_KEY else 'EMPTY'}. "
+            "Worker started without required environment variables."
+        )
+
     if images and isinstance(images, dict):
         processed_angles = {}
         for key in ANGLE_KEYS:
