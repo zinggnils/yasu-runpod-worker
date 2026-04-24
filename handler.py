@@ -284,6 +284,10 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
 
     if mode == "texture":
         visia_img = make_visia_duotone(clean_rgba)
+        # 2x upsample + extra sharpening on texture VISIA only — reveals fine pore/texture detail
+        vw, vh = visia_img.size
+        visia_img = visia_img.resize((vw * 2, vh * 2), Image.LANCZOS)
+        visia_img = visia_img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=180, threshold=1))
         texture_score = compute_texture_score(clean_rgba)
         print(f"[process_single] texture_score={texture_score}")
         with ThreadPoolExecutor(max_workers=2) as pool:
