@@ -276,6 +276,12 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
         clean_rgba = remove(original, session=session).convert("RGBA")
     # Guided filter: snaps soft matting edges to actual image boundaries (fixes fringing)
     clean_rgba = refine_alpha(original, clean_rgba)
+
+    # 2x upsample before all processing — sharpening + clarity run at full 2x resolution
+    w, h = clean_rgba.size
+    clean_rgba = clean_rgba.resize((w * 2, h * 2), Image.LANCZOS)
+    print(f"[process_single] Upscaled to {clean_rgba.size}")
+
     uid = uuid.uuid4().hex[:8]
 
     clean_img = on_black(clean_rgba)
