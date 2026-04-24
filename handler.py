@@ -4,6 +4,7 @@ import os
 import uuid
 import requests
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageFilter
 import numpy as np
 import cv2
@@ -27,13 +28,13 @@ except Exception as e:
 
 def upload_to_supabase(img: Image.Image, filename: str) -> str:
     buf = BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="WEBP", quality=88, method=2)
     buf.seek(0)
     path = f"processed/{filename}"
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     resp = requests.put(url, data=buf.read(), headers={
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "image/png",
+        "Content-Type": "image/webp",
         "x-upsert": "true",
     })
     if resp.status_code not in (200, 201):
@@ -130,14 +131,16 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(gray)
 
-    # Clarity pass on the grayscale before colormap — lifts skin texture in VISIA view
+    # Clarity pass on the grayscale before rendering — lifts skin texture in VISIA view
     contrast_f = contrast.astype(np.float32)
     blur_large = cv2.GaussianBlur(contrast_f, (0, 0), sigmaX=30)
     contrast_clarity = np.clip(contrast_f + (contrast_f - blur_large) * 0.40, 0, 255).astype(np.uint8)
 
-    bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
-    bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
-    duotone = Image.fromarray(bone_rgb, mode="RGB")
+    # Inverted duotone: shadows → white (#ffffff), highlights → black (#000000)
+    # Makes pores/texture appear as bright detail on dark smooth skin — clean clinical look
+    inverted = 255 - contrast_clarity
+    gray_rgb = cv2.cvtColor(inverted, cv2.COLOR_GRAY2RGB)
+    duotone = Image.fromarray(gray_rgb, mode="RGB")
     # Fine sharpening pass
     duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.5, percent=200, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
@@ -276,25 +279,21 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
         clean_rgba = remove(original, session=session).convert("RGBA")
     # Guided filter: snaps soft matting edges to actual image boundaries (fixes fringing)
     clean_rgba = refine_alpha(original, clean_rgba)
-
-    # 2x upsample before all processing — sharpening + clarity run at full 2x resolution
-    w, h = clean_rgba.size
-    clean_rgba = clean_rgba.resize((w * 2, h * 2), Image.LANCZOS)
-    print(f"[process_single] Upscaled to {clean_rgba.size}")
-
     uid = uuid.uuid4().hex[:8]
-
     clean_img = on_black(clean_rgba)
 
     if mode == "texture":
         visia_img = make_visia_duotone(clean_rgba)
         texture_score = compute_texture_score(clean_rgba)
         print(f"[process_single] texture_score={texture_score}")
-        return {
-            "clean_image_url":  upload_to_supabase(clean_img,  f"clean_{label}_{uid}.png"),
-            "visia_image_url":  upload_to_supabase(visia_img,  f"visia_{label}_{uid}.png"),
-            "texture_score":    texture_score,
-        }
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_clean = pool.submit(upload_to_supabase, clean_img, f"clean_{label}_{uid}.webp")
+            f_visia = pool.submit(upload_to_supabase, visia_img, f"visia_{label}_{uid}.webp")
+            return {
+                "clean_image_url": f_clean.result(),
+                "visia_image_url": f_visia.result(),
+                "texture_score":   texture_score,
+            }
 
     # ── Default: redness flow ──
     visia_img = make_visia_duotone(clean_rgba)
@@ -302,13 +301,18 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     redness_on_clean = apply_overlay(clean_img, overlay)
     redness_on_visia = apply_overlay(visia_img, overlay)
 
-    return {
-        "clean_image_url":         upload_to_supabase(clean_img,        f"clean_{label}_{uid}.png"),
-        "visia_image_url":         upload_to_supabase(visia_img,        f"visia_{label}_{uid}.png"),
-        "redness_image_url":       upload_to_supabase(redness_on_clean, f"redness_{label}_{uid}.png"),
-        "redness_visia_image_url": upload_to_supabase(redness_on_visia, f"redness_visia_{label}_{uid}.png"),
-        "redness_score": redness_score,
-    }
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_clean  = pool.submit(upload_to_supabase, clean_img,        f"clean_{label}_{uid}.webp")
+        f_visia  = pool.submit(upload_to_supabase, visia_img,        f"visia_{label}_{uid}.webp")
+        f_red    = pool.submit(upload_to_supabase, redness_on_clean, f"redness_{label}_{uid}.webp")
+        f_redv   = pool.submit(upload_to_supabase, redness_on_visia, f"redness_visia_{label}_{uid}.webp")
+        return {
+            "clean_image_url":         f_clean.result(),
+            "visia_image_url":         f_visia.result(),
+            "redness_image_url":       f_red.result(),
+            "redness_visia_image_url": f_redv.result(),
+            "redness_score": redness_score,
+        }
 
 
 def handler(job):
