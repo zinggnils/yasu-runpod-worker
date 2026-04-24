@@ -10,7 +10,7 @@ import cv2
 import onnxruntime as ort
 from rembg import new_session, remove
 
-print(f"ORT version: {ort.__version__}")
+print(f"ORT version: {ort.__version__}")  # build trigger
 print(f"Available providers: {ort.get_available_providers()}")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
