@@ -260,10 +260,8 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     clean_img = on_black(clean_rgba)
 
     if mode == "texture":
-        texture_img = compute_texture_spots(clean_rgba)
         return {
-            "clean_image_url":   upload_to_supabase(clean_img,   f"clean_{label}_{uid}.png"),
-            "texture_image_url": upload_to_supabase(texture_img, f"texture_{label}_{uid}.png"),
+            "clean_image_url": upload_to_supabase(clean_img, f"clean_{label}_{uid}.png"),
         }
 
     # ── Default: redness flow ──
