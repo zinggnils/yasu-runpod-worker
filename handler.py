@@ -159,24 +159,124 @@ def apply_overlay(base_rgb: Image.Image, overlay_rgba: Image.Image) -> Image.Ima
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 
 
-def process_single(image_b64: str, label: str) -> dict:
-    img_data = base64.b64decode(image_b64)
-    original = Image.open(BytesIO(img_data)).convert("RGB")
+def compute_texture_spots(clean_rgba: Image.Image) -> Image.Image:
+    """Locate 5-15 strongest texture problem spots and mark them with yellow circles.
+
+    Algorithm:
+    1. Generate 'ideal smooth skin' reference via bilateral filter (AI proxy — not saved)
+    2. Diff = |original_gray - smooth_reference| → highlights texture irregularities
+    3. Combine with high-frequency Laplacian for fine pore detail
+    4. Apply face skin mask (exclude hair + ears via erosion)
+    5. Non-maximum suppression → pick top 5-15 distinct spots
+    6. Draw yellow circles on clean RGB image
+    """
+    clean_rgba = clean_rgba.convert("RGBA")
+    rgb_arr  = np.array(clean_rgba.convert("RGB"))
+    alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
+    h, w = alpha_arr.shape
+
+    # ── Face skin mask (exclude ears + hair) ──
+    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
+    erode_px = max(20, int(min(h, w) * 0.05))
+    kernel = np.ones((erode_px, erode_px), np.uint8)
+    eroded = cv2.erode(alpha_uint8, kernel, iterations=1)
+    inner_face = eroded > 100
+
+    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
+                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
+                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
+    skin_mask = inner_face & (brightness > 0.18)
+
+    gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    # ── "AI better skin" reference: bilateral filter (smooths skin, preserves edges) ──
+    # This reference is computed in memory only — never uploaded/saved
+    smooth_ref = cv2.bilateralFilter(gray.astype(np.uint8), 25, 80, 80).astype(np.float32)
+
+    # ── Texture problem map ──
+    diff      = np.abs(gray - smooth_ref)                              # macro roughness
+    laplacian = np.abs(cv2.Laplacian(gray.astype(np.uint8), cv2.CV_32F))  # fine pores
+    texture_map = diff * 0.55 + laplacian * 0.45
+    texture_map[~skin_mask] = 0.0
+
+    if texture_map.max() < 1e-6:
+        # No texture detected — return clean image unchanged
+        return clean_rgba.convert("RGB")
+
+    texture_map /= texture_map.max()
+
+    # ── Non-maximum suppression: pick top 5-15 spots ──
+    min_dist = max(18, int(min(h, w) * 0.04))   # minimum pixels between spots
+    spots = []
+    temp   = texture_map.copy()
+
+    for _ in range(15):
+        yx = np.unravel_index(np.argmax(temp), temp.shape)
+        val = temp[yx]
+        if val < 0.08:   # stop if remaining peaks are too weak
+            break
+        y, x = yx
+        spots.append((x, y, float(val)))
+        # Suppress neighbourhood
+        y1, y2 = max(0, y - min_dist), min(h, y + min_dist)
+        x1, x2 = max(0, x - min_dist), min(w, x + min_dist)
+        temp[y1:y2, x1:x2] = 0.0
+
+    # Ensure at least 5 if the skin area is large enough
+    if len(spots) < 5 and np.any(skin_mask):
+        min_dist2 = max(10, min_dist // 2)
+        for _ in range(5 - len(spots)):
+            yx = np.unravel_index(np.argmax(temp), temp.shape)
+            val = temp[yx]
+            if val < 0.02:
+                break
+            y, x = yx
+            spots.append((x, y, float(val)))
+            y1, y2 = max(0, y - min_dist2), min(h, y + min_dist2)
+            x1, x2 = max(0, x - min_dist2), min(w, x + min_dist2)
+            temp[y1:y2, x1:x2] = 0.0
+
+    print(f"[texture] Found {len(spots)} spots")
+
+    # ── Draw yellow markers on clean RGB image ──
+    result = np.array(clean_rgba.convert("RGB")).copy()
+    YELLOW = (255, 210, 0)
+
+    for x, y, strength in spots:
+        outer_r = int(10 + strength * 14)   # 10–24 px depending on severity
+        inner_r = max(3, outer_r // 4)
+        cv2.circle(result, (x, y), outer_r, YELLOW, 2, lineType=cv2.LINE_AA)
+        cv2.circle(result, (x, y), inner_r, YELLOW, -1, lineType=cv2.LINE_AA)
+
+    return Image.fromarray(result, mode="RGB")
+
+
+def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
+    img_data  = base64.b64decode(image_b64)
+    original  = Image.open(BytesIO(img_data)).convert("RGB")
     clean_rgba = remove(original, session=session).convert("RGBA")
     uid = uuid.uuid4().hex[:8]
 
     clean_img = on_black(clean_rgba)
-    visia_img = make_visia_duotone(clean_rgba)
 
+    if mode == "texture":
+        texture_img = compute_texture_spots(clean_rgba)
+        return {
+            "clean_image_url":   upload_to_supabase(clean_img,   f"clean_{label}_{uid}.png"),
+            "texture_image_url": upload_to_supabase(texture_img, f"texture_{label}_{uid}.png"),
+        }
+
+    # ── Default: redness flow ──
+    visia_img = make_visia_duotone(clean_rgba)
     overlay, redness_score = compute_redness_overlay(clean_rgba)
     redness_on_clean = apply_overlay(clean_img, overlay)
     redness_on_visia = apply_overlay(visia_img, overlay)
 
     return {
-        "clean_image_url":        upload_to_supabase(clean_img,        f"clean_{label}_{uid}.png"),
-        "visia_image_url":        upload_to_supabase(visia_img,        f"visia_{label}_{uid}.png"),
-        "redness_image_url":      upload_to_supabase(redness_on_clean, f"redness_{label}_{uid}.png"),
-        "redness_visia_image_url":upload_to_supabase(redness_on_visia, f"redness_visia_{label}_{uid}.png"),
+        "clean_image_url":         upload_to_supabase(clean_img,        f"clean_{label}_{uid}.png"),
+        "visia_image_url":         upload_to_supabase(visia_img,        f"visia_{label}_{uid}.png"),
+        "redness_image_url":       upload_to_supabase(redness_on_clean, f"redness_{label}_{uid}.png"),
+        "redness_visia_image_url": upload_to_supabase(redness_on_visia, f"redness_visia_{label}_{uid}.png"),
         "redness_score": redness_score,
     }
 
@@ -199,6 +299,9 @@ def handler(job):
             "Worker started without required environment variables."
         )
 
+    mode = job_input.get("mode", "redness")
+    print(f"[handler] mode={mode}")
+
     if images and isinstance(images, dict):
         processed_angles = {}
         for key in ANGLE_KEYS:
@@ -206,7 +309,7 @@ def handler(job):
             if b64:
                 print(f"[handler] Processing {key}, b64 length={len(b64)}")
                 try:
-                    result = process_single(b64, key)
+                    result = process_single(b64, key, mode=mode)
                     processed_angles[key] = result
                     print(f"[handler] {key} OK — score={result.get('redness_score')}")
                 except Exception as e:
