@@ -260,8 +260,10 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     clean_img = on_black(clean_rgba)
 
     if mode == "texture":
+        visia_img = make_visia_duotone(clean_rgba)
         return {
-            "clean_image_url": upload_to_supabase(clean_img, f"clean_{label}_{uid}.png"),
+            "clean_image_url": upload_to_supabase(clean_img,  f"clean_{label}_{uid}.png"),
+            "visia_image_url": upload_to_supabase(visia_img,  f"visia_{label}_{uid}.png"),
         }
 
     # ── Default: redness flow ──
