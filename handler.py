@@ -60,12 +60,50 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict):
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
 
+def guided_filter_alpha(guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 6, eps: float = 1e-3) -> np.ndarray:
+    """Edge-aware alpha mask refinement using guided filter.
+    Snaps rembg's upsampled mask edges to actual image boundaries — fixes fringing and jagged hair edges."""
+    def box(I, r):
+        return cv2.boxFilter(I.astype(np.float32), -1, (2 * r + 1, 2 * r + 1))
+
+    I = guide_gray.astype(np.float32) / 255.0
+    p = alpha.astype(np.float32) / 255.0
+
+    mean_I  = box(I, radius)
+    mean_p  = box(p, radius)
+    mean_Ip = box(I * p, radius)
+    cov_Ip  = mean_Ip - mean_I * mean_p
+
+    mean_II = box(I * I, radius)
+    var_I   = mean_II - mean_I * mean_I
+
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+
+    mean_a = box(a, radius)
+    mean_b = box(b, radius)
+
+    q = mean_a * I + mean_b
+    return np.clip(q * 255, 0, 255).astype(np.uint8)
+
+
+def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Image:
+    """Apply guided filter to rembg's alpha mask using original image as guide.
+    Eliminates fringing and sharpens hair/skin boundary without touching the face content."""
+    gray = cv2.cvtColor(np.array(original_rgb.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    alpha = np.array(clean_rgba.split()[3])
+    alpha_refined = guided_filter_alpha(gray, alpha, radius=6, eps=1e-3)
+    result = clean_rgba.copy()
+    result.putalpha(Image.fromarray(alpha_refined))
+    return result
+
+
 def on_black(clean_rgba: Image.Image) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
     alpha = clean_rgba.split()[3]
     rgb = clean_rgba.convert("RGB")
-    # Strong sharpening for crisp clinical output
-    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=2.0, percent=160, threshold=2))
+    # Strong sharpening for crisp clinical output — tuned for full-resolution phone photos
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=180, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(rgb, mask=alpha)
     return result
@@ -254,7 +292,10 @@ def compute_texture_spots(clean_rgba: Image.Image) -> Image.Image:
 def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = Image.open(BytesIO(img_data)).convert("RGB")
+    print(f"[process_single] Input size: {original.size}")
     clean_rgba = remove(original, session=session).convert("RGBA")
+    # Refine rembg's upsampled mask edges with guided filter — fixes fringing at full resolution
+    clean_rgba = refine_alpha(original, clean_rgba)
     uid = uuid.uuid4().hex[:8]
 
     clean_img = on_black(clean_rgba)
