@@ -136,11 +136,9 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     blur_large = cv2.GaussianBlur(contrast_f, (0, 0), sigmaX=30)
     contrast_clarity = np.clip(contrast_f + (contrast_f - blur_large) * 0.40, 0, 255).astype(np.uint8)
 
-    # Inverted duotone: shadows → white (#ffffff), highlights → black (#000000)
-    # Makes pores/texture appear as bright detail on dark smooth skin — clean clinical look
-    inverted = 255 - contrast_clarity
-    gray_rgb = cv2.cvtColor(inverted, cv2.COLOR_GRAY2RGB)
-    duotone = Image.fromarray(gray_rgb, mode="RGB")
+    bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
+    bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
+    duotone = Image.fromarray(bone_rgb, mode="RGB")
     # Fine sharpening pass
     duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.5, percent=200, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
