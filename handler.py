@@ -122,7 +122,7 @@ def on_black(clean_rgba: Image.Image) -> Image.Image:
     return result
 
 
-def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
+def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
     alpha_arr = np.array(clean_rgba.split()[3])
     rgb_arr = np.array(clean_rgba.convert("RGB"))
@@ -131,15 +131,19 @@ def make_visia_duotone(clean_rgba: Image.Image) -> Image.Image:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(gray)
 
-    # Clarity pass on the grayscale before rendering — lifts skin texture in VISIA view
     contrast_f = contrast.astype(np.float32)
     blur_large = cv2.GaussianBlur(contrast_f, (0, 0), sigmaX=30)
     contrast_clarity = np.clip(contrast_f + (contrast_f - blur_large) * 0.40, 0, 255).astype(np.uint8)
 
-    bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
-    bone_rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
-    duotone = Image.fromarray(bone_rgb, mode="RGB")
-    # Fine sharpening pass
+    if invert:
+        # Texture mode: inverted white — pores/texture appear bright on dark skin
+        inv = 255 - contrast_clarity
+        duotone = Image.fromarray(cv2.cvtColor(inv, cv2.COLOR_GRAY2RGB), mode="RGB")
+    else:
+        # Redness mode: BONE colormap — blue-gray tones, April 24 look
+        bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
+        duotone = Image.fromarray(cv2.cvtColor(bone, cv2.COLOR_BGR2RGB), mode="RGB")
+
     duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.5, percent=200, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(duotone, mask=Image.fromarray(alpha_arr, mode="L"))
@@ -281,7 +285,7 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     clean_img = on_black(clean_rgba)
 
     if mode == "texture":
-        visia_img = make_visia_duotone(clean_rgba)
+        visia_img = make_visia_duotone(clean_rgba, invert=True)
         # 2x upsample + extra sharpening on texture VISIA only — reveals fine pore/texture detail
         vw, vh = visia_img.size
         visia_img = visia_img.resize((vw * 2, vh * 2), Image.LANCZOS)
