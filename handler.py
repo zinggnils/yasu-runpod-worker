@@ -151,65 +151,77 @@ def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.I
 
 
 def compute_redness_overlay(clean_rgba: Image.Image) -> tuple:
-    """Smooth Gaussian-blob redness overlay. Excludes hair (brightness) and ears (mask erosion).
+    """ITA-corrected erythema detection + per-cluster Gaussian fitting.
     Returns (overlay RGBA image, score 0-100). Neon cyan (40, 220, 255)."""
     clean_rgba = clean_rgba.convert("RGBA")
-    rgb_arr = np.array(clean_rgba)[..., :3].astype(np.float32)
+    rgb_arr = np.array(clean_rgba)[..., :3]
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    r, g, b = rgb_arr[..., 0], rgb_arr[..., 1], rgb_arr[..., 2]
-    redness = r - (g + b) / 2.0
-    # Perceptual brightness in [0, 1]
-    brightness = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
+                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
+                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
 
-    # Erode alpha mask to exclude ears and peripheral skin protrusions
+    # Erode alpha mask to exclude ears and peripheral skin
     alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
     erode_px = max(15, int(min(h, w) * 0.04))
-    kernel = np.ones((erode_px, erode_px), np.uint8)
-    eroded = cv2.erode(alpha_uint8, kernel, iterations=1)
+    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
     inner_face = eroded > 100
-
-    # Lowered brightness threshold (0.18) to better handle darker/olive skin tones
     skin_mask = inner_face & (brightness > 0.18)
 
     if not np.any(skin_mask):
         return Image.new("RGBA", (w, h), (0, 0, 0, 0)), 0
 
-    # Normalize redness on inner skin only — tight range highlights actual redness
-    lo, hi = np.percentile(redness[skin_mask], [55, 97])
-    redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+    # ── ITA-corrected erythema (Lab a* channel) ──
+    # a* separates red (hemoglobin) from brown (melanin) better than raw R channel.
+    # Using the person's own skin median as baseline means dark/light skin tones
+    # are treated equally — redness is always measured as deviation from THEIR normal.
+    lab = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+    a_star = lab[..., 1] - 128.0          # centre at 0: positive = red, negative = green
+    skin_baseline = np.median(a_star[skin_mask])   # this person's neutral skin tone
+    ei = np.clip(a_star - skin_baseline, 0, None)  # only deviations above baseline = redness
 
-    # Score computed from RAW redness signal BEFORE visualization blur — accurate, blur-independent
-    # Uses mean of top-25% most-red skin pixels to reflect peak redness severity
+    ei_max = np.percentile(ei[skin_mask], 98)
+    ei_n = np.clip(ei / (ei_max + 1e-6), 0.0, 1.0)
+
+    # Score: top-25% mean of skin pixels — reflects peak severity, not just coverage
     face_skin = skin_mask & (alpha_arr > 0.2)
     if np.any(face_skin):
-        rn_face = redness_n[face_skin]
-        p75 = np.percentile(rn_face, 75)
-        top25_mean = float(rn_face[rn_face >= max(p75, 0.01)].mean())
-        # Scale: 0.2 raw → ~20 score (mild), 0.5 raw → ~50 (moderate), 0.8+ → ~80+ (severe)
-        score = int(min(100, top25_mean * 100))
+        rn = ei_n[face_skin]
+        p75 = np.percentile(rn, 75)
+        score = int(min(100, float(rn[rn >= max(p75, 0.01)].mean()) * 100))
     else:
         score = 0
 
-    # Build smooth mask for visualization: redness × face alpha × brightness weight
-    mask = redness_n * alpha_arr
+    # Build visualization mask
+    mask = ei_n * alpha_arr
     mask *= np.where(skin_mask, 1.0, 0.0)
     mask *= np.clip((brightness - 0.12) / 0.88, 0.0, 1.0)
-
-    # Softer threshold (0.10 → more of the redness area covered, clinically realistic)
     mask = np.clip((mask - 0.10) / 0.90, 0.0, 1.0)
 
-    # Gaussian blur → smooth neon blobs (no hard edges)
-    mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=8))
+    # ── Phase 2: per-cluster Gaussian fitting ──
+    # Each redness zone gets its own blur radius proportional to its area.
+    # Small acne spot → tight Gaussian. Large cheek flush → wide Gaussian.
+    # Result: distinct clinical spots instead of one continuous wash.
+    binary = (mask > 0.25).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
 
-    # Neon cyan — exact same colour as the reference best result
+    blob_sum = np.zeros((h, w), np.float32)
+    for i in range(1, n_labels):
+        if stats[i, cv2.CC_STAT_AREA] < 80:   # skip noise
+            continue
+        sigma = max(6.0, np.sqrt(stats[i, cv2.CC_STAT_AREA] / np.pi) * 1.4)
+        component = (labels == i).astype(np.float32) * mask  # preserve intensity
+        blob_sum += cv2.GaussianBlur(component, (0, 0), sigmaX=sigma)
+
+    if blob_sum.max() > 1e-6:
+        blob_sum = np.clip(blob_sum / blob_sum.max(), 0.0, 1.0)
+
     neon = np.zeros((h, w, 4), dtype=np.uint8)
     neon[..., 0] = 40
     neon[..., 1] = 220
     neon[..., 2] = 255
-    neon[..., 3] = np.array(mask_img)
+    neon[..., 3] = (blob_sum * 255).astype(np.uint8)
 
     return Image.fromarray(neon, mode="RGBA"), score
 
