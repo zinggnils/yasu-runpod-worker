@@ -312,22 +312,29 @@ def handler(job):
     print(f"[handler] mode={mode}")
 
     if images and isinstance(images, dict):
-        processed_angles = {}
-        for key in ANGLE_KEYS:
+        def process_angle(key):
             b64 = images.get(key)
-            if b64:
-                print(f"[handler] Processing {key}, b64 length={len(b64)}")
-                try:
-                    result = process_single(b64, key, mode=mode)
-                    processed_angles[key] = result
-                    score_log = result.get('redness_score') if result.get('redness_score') is not None else result.get('texture_score')
-                    print(f"[handler] {key} OK — score={score_log}")
-                except Exception as e:
-                    print(f"[handler] {key} FAILED: {e}")
-                    traceback.print_exc()
-                    processed_angles[key] = {"error": str(e)}
-            else:
+            if not b64:
                 print(f"[handler] {key} — no b64 data, skipping")
+                return key, None
+            print(f"[handler] Processing {key}, b64 length={len(b64)}")
+            try:
+                result = process_single(b64, key, mode=mode)
+                score_log = result.get('redness_score') if result.get('redness_score') is not None else result.get('texture_score')
+                print(f"[handler] {key} OK — score={score_log}")
+                return key, result
+            except Exception as e:
+                print(f"[handler] {key} FAILED: {e}")
+                traceback.print_exc()
+                return key, {"error": str(e)}
+
+        processed_angles = {}
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(process_angle, key): key for key in ANGLE_KEYS}
+            for future in futures:
+                key, result = future.result()
+                if result is not None:
+                    processed_angles[key] = result
 
         print(f"[handler] Processed angles: {list(processed_angles.keys())}")
 
