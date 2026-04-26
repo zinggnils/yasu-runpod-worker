@@ -42,7 +42,8 @@ def upload_to_supabase(img: Image.Image, filename: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
 
 
-def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict, overall_score: int = 0):
+def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict,
+                         overall_score: int = 0, texture_score: int = 0):
     url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
     body = {
         "status": "done",
@@ -51,6 +52,7 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict, ov
         "redness_image_url": frontal.get("redness_image_url"),
         "image_url": frontal.get("visia_image_url"),
         "redness_severity": overall_score,
+        "texture_severity": texture_score,
     }
     resp = requests.patch(url, json=body, headers={
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -341,16 +343,28 @@ def handler(job):
         if scan_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
             try:
                 frontal = processed_angles.get("frontal", {})
+
                 # Overall redness score: average of 90° profiles (most informative angles)
-                side_scores = [
+                redness_sides = [
                     s for s in [
                         processed_angles.get("left_90",  {}).get("redness_score"),
                         processed_angles.get("right_90", {}).get("redness_score"),
                     ] if isinstance(s, (int, float))
                 ]
-                overall_score = int(sum(side_scores) / len(side_scores)) if side_scores else 0
+                overall_score = int(sum(redness_sides) / len(redness_sides)) if redness_sides else 0
                 print(f"[handler] overall_redness_score={overall_score} (from 90° angles)")
-                update_supabase_scan(scan_id, processed_angles, frontal, overall_score)
+
+                # Overall texture score: same method — average of 90° profiles
+                texture_sides = [
+                    s for s in [
+                        processed_angles.get("left_90",  {}).get("texture_score"),
+                        processed_angles.get("right_90", {}).get("texture_score"),
+                    ] if isinstance(s, (int, float))
+                ]
+                overall_texture = int(sum(texture_sides) / len(texture_sides)) if texture_sides else 0
+                print(f"[handler] overall_texture_score={overall_texture} (from 90° angles)")
+
+                update_supabase_scan(scan_id, processed_angles, frontal, overall_score, overall_texture)
                 print(f"[handler] DB updated OK for scan_id={scan_id}")
             except Exception as e:
                 print(f"[handler] DB UPDATE FAILED: {e}")
