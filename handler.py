@@ -190,17 +190,22 @@ def compute_redness_score(clean_rgba: Image.Image) -> int:
 
 
 def compute_texture_score(clean_rgba: Image.Image) -> int:
-    """Texture severity score 0-100 using same methodology as redness score.
-    Bilateral-filter diff + Laplacian → normalized texture map → top-25% mean × 100."""
+    """Texture severity score 0-100.
+    Speed: score on half-res (4× fewer pixels) + bilateral d=9 (7.7× faster than d=25).
+    Accuracy: 99th-percentile normalization (no outlier collapse) + LoG (pre-blur kills JPEG noise)."""
     clean_rgba = clean_rgba.convert("RGBA")
-    rgb_arr = np.array(clean_rgba.convert("RGB"))
-    alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
+
+    # ── Downsample to 50% for scoring — 4× fewer pixels, negligible accuracy loss ──
+    w0, h0 = clean_rgba.size
+    small = clean_rgba.resize((w0 // 2, h0 // 2), Image.BILINEAR)
+
+    rgb_arr  = np.array(small.convert("RGB"))
+    alpha_arr = np.array(small)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
     alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
-    erode_px = max(15, int(min(h, w) * 0.04))
-    kernel = np.ones((erode_px, erode_px), np.uint8)
-    eroded = cv2.erode(alpha_uint8, kernel, iterations=1)
+    erode_px = max(8, int(min(h, w) * 0.04))
+    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
     inner_face = eroded > 100
 
     brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
@@ -212,16 +217,26 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
         return 0
 
     gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    smooth_ref = cv2.bilateralFilter(gray.astype(np.uint8), 25, 80, 80).astype(np.float32)
+
+    # d=9: ~7.7× faster than d=25, better pore-scale sensitivity
+    smooth_ref = cv2.bilateralFilter(gray.astype(np.uint8), 9, 80, 80).astype(np.float32)
     diff = np.abs(gray - smooth_ref)
-    laplacian = np.abs(cv2.Laplacian(gray.astype(np.uint8), cv2.CV_32F))
+
+    # LoG: pre-blur before Laplacian kills JPEG compression noise
+    gray_smooth = cv2.GaussianBlur(gray.astype(np.uint8), (3, 3), 0.8)
+    laplacian = np.abs(cv2.Laplacian(gray_smooth, cv2.CV_32F))
+
     texture_map = diff * 0.55 + laplacian * 0.45
     texture_map[~skin_mask] = 0.0
 
-    if texture_map.max() < 1e-6:
+    skin_vals = texture_map[skin_mask]
+    if skin_vals.max() < 1e-6:
         return 0
 
-    texture_map /= texture_map.max()
+    # 99th-percentile ceiling: prevents a single outlier pixel from collapsing the scale
+    ceil = np.percentile(skin_vals, 99)
+    texture_map = np.clip(texture_map / (ceil + 1e-6), 0.0, 1.0)
+
     tm_face = texture_map[skin_mask]
     p75 = np.percentile(tm_face, 75)
     return int(min(100, float(tm_face[tm_face >= max(p75, 0.01)].mean()) * 100))
@@ -247,10 +262,6 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
 
     if mode == "texture":
         visia_img = make_visia_duotone(clean_rgba, invert=True)
-        # 2x upsample + extra sharpening on texture VISIA only — reveals fine pore/texture detail
-        vw, vh = visia_img.size
-        visia_img = visia_img.resize((vw * 2, vh * 2), Image.LANCZOS)
-        visia_img = visia_img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=180, threshold=1))
         texture_score = compute_texture_score(clean_rgba)
         print(f"[process_single] texture_score={texture_score}")
         with ThreadPoolExecutor(max_workers=2) as pool:
