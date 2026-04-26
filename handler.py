@@ -236,19 +236,10 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     print(f"[process_single] Input size: {original.size}")
     # alpha_matting=True: trimap-based matting preserves fine hair strands u2net would clip.
     # Falls back to standard removal if pymatting is unavailable.
-    try:
-        clean_rgba = remove(
-            original,
-            session=session,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_size=10,
-        ).convert("RGBA")
-        print("[process_single] Alpha matting OK")
-    except Exception as e:
-        print(f"[process_single] Alpha matting failed ({e}), falling back to standard removal")
-        clean_rgba = remove(original, session=session).convert("RGBA")
+    # Alpha matting disabled: pymatting Cholesky decomposition fails repeatedly on most inputs,
+    # adding ~15–20s of wasted retries per scan. The guided filter below handles edge cleanup.
+    clean_rgba = remove(original, session=session).convert("RGBA")
+    print("[process_single] Background removed")
     # Guided filter: snaps soft matting edges to actual image boundaries (fixes fringing)
     clean_rgba = refine_alpha(original, clean_rgba)
     uid = uuid.uuid4().hex[:8]
@@ -318,7 +309,8 @@ def handler(job):
                 try:
                     result = process_single(b64, key, mode=mode)
                     processed_angles[key] = result
-                    print(f"[handler] {key} OK — score={result.get('redness_score')}")
+                    score_log = result.get('redness_score') if result.get('redness_score') is not None else result.get('texture_score')
+                    print(f"[handler] {key} OK — score={score_log}")
                 except Exception as e:
                     print(f"[handler] {key} FAILED: {e}")
                     traceback.print_exc()
