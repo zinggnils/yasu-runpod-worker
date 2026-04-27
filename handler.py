@@ -154,11 +154,16 @@ def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.I
 
 
 def compute_redness_score(clean_rgba: Image.Image) -> int:
-    """ITA-corrected erythema score 0-100. No image output — score only.
-    Lab a* separates red (haemoglobin) from brown (melanin); using the
-    person's own skin median as baseline makes scores skin-tone neutral."""
+    """Absolute erythema score 0-100 using Lab a* channel.
+    Fixed universal baseline (a*=10 = neutral skin) instead of personal median —
+    prevents self-cancellation for uniform redness (rosacea). REDNESS_MAX=35
+    covers the full clinical range from mild flush to severe rosacea."""
+    # Fixed calibration constants (skin-tone neutral in Lab a*)
+    NEUTRAL_THRESHOLD = 10.0   # a* for non-reddened skin (universal)
+    REDNESS_MAX       = 35.0   # a* ~35 = severe rosacea / clinical max
+
     clean_rgba = clean_rgba.convert("RGBA")
-    rgb_arr = np.array(clean_rgba)[..., :3]
+    rgb_arr   = np.array(clean_rgba)[..., :3]
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
@@ -174,21 +179,14 @@ def compute_redness_score(clean_rgba: Image.Image) -> int:
     if not np.any(skin_mask):
         return 0
 
-    lab = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab    = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2LAB).astype(np.float32)
     a_star = lab[..., 1] - 128.0
-    baseline = np.median(a_star[skin_mask])
-    ei = np.clip(a_star - baseline, 0, None)
 
-    ei_max = np.percentile(ei[skin_mask], 98)
-    ei_n = np.clip(ei / (ei_max + 1e-6), 0.0, 1.0)
+    # Absolute redness above neutral threshold — uniform redness scores correctly
+    ei   = np.clip(a_star - NEUTRAL_THRESHOLD, 0, None)
+    ei_n = np.clip(ei / REDNESS_MAX, 0.0, 1.0)
 
-    face_skin = skin_mask & (alpha_arr > 0.2)
-    if not np.any(face_skin):
-        return 0
-
-    rn = ei_n[face_skin]
-    p75 = np.percentile(rn, 75)
-    return int(min(100, float(rn[rn >= max(p75, 0.01)].mean()) * 100))
+    return int(ei_n[skin_mask].mean() * 100)
 
 
 def compute_texture_score(clean_rgba: Image.Image) -> int:
@@ -344,25 +342,29 @@ def handler(job):
             try:
                 frontal = processed_angles.get("frontal", {})
 
-                # Overall redness score: average of 90° profiles (most informative angles)
-                redness_sides = [
+                # Overall redness score: frontal + 45° angles show the cheek butterfly
+                # pattern most directly. 90° profiles see redness obliquely and underreport.
+                redness_vals = [
                     s for s in [
-                        processed_angles.get("left_90",  {}).get("redness_score"),
-                        processed_angles.get("right_90", {}).get("redness_score"),
+                        processed_angles.get("frontal",   {}).get("redness_score"),
+                        processed_angles.get("left_45",   {}).get("redness_score"),
+                        processed_angles.get("right_45",  {}).get("redness_score"),
                     ] if isinstance(s, (int, float))
                 ]
-                overall_score = int(sum(redness_sides) / len(redness_sides)) if redness_sides else 0
-                print(f"[handler] overall_redness_score={overall_score} (from 90° angles)")
+                overall_score = int(sum(redness_vals) / len(redness_vals)) if redness_vals else 0
+                print(f"[handler] overall_redness_score={overall_score} (frontal+45°)")
 
-                # Overall texture score: same method — average of 90° profiles
-                texture_sides = [
+                # Overall texture score: same angles — pores/scars face forward,
+                # foreshortened at 90° profile so frontal+45° give the clearest read.
+                texture_vals = [
                     s for s in [
-                        processed_angles.get("left_90",  {}).get("texture_score"),
-                        processed_angles.get("right_90", {}).get("texture_score"),
+                        processed_angles.get("frontal",   {}).get("texture_score"),
+                        processed_angles.get("left_45",   {}).get("texture_score"),
+                        processed_angles.get("right_45",  {}).get("texture_score"),
                     ] if isinstance(s, (int, float))
                 ]
-                overall_texture = int(sum(texture_sides) / len(texture_sides)) if texture_sides else 0
-                print(f"[handler] overall_texture_score={overall_texture} (from 90° angles)")
+                overall_texture = int(sum(texture_vals) / len(texture_vals)) if texture_vals else 0
+                print(f"[handler] overall_texture_score={overall_texture} (frontal+45°)")
 
                 update_supabase_scan(scan_id, processed_angles, frontal, overall_score, overall_texture)
                 print(f"[handler] DB updated OK for scan_id={scan_id}")
