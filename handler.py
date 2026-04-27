@@ -25,7 +25,6 @@ except Exception as e:
     print(f"Failed to initialize GPU session, falling back: {e}")
     session = new_session("u2net")
 
-
 def upload_to_supabase(img: Image.Image, filename: str) -> str:
     buf = BytesIO()
     img.save(buf, format="WEBP", quality=88, method=2)
@@ -40,7 +39,6 @@ def upload_to_supabase(img: Image.Image, filename: str) -> str:
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Storage upload failed: {resp.status_code} {resp.text[:200]}")
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
-
 
 def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict,
                          overall_score: int = 0, texture_score: int = 0):
@@ -63,6 +61,56 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict,
     if resp.status_code not in (200, 201, 204):
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
+def detect_hair_regions(rgb: np.ndarray) -> np.ndarray:
+    """Detect hair regions using HSV color + texture analysis.
+    Hair is typically darker, moderately saturated, and has Hue 0-30 or 330-360 (browns/reds).
+    Returns a binary mask (0-255, 255=hair detected)."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = cv2.split(hsv)
+    
+    # Hair: Brown/Red hues (0-30 or 330-360) + moderate saturation + darker value
+    hue_mask1 = cv2.inRange(h, 0, 30)      # Red-brown range
+    hue_mask2 = cv2.inRange(h, 330, 360)   # Brown wrapping around
+    hue_mask = cv2.bitwise_or(hue_mask1, hue_mask2)
+    
+    # Saturation: moderate (hair isn't fully desaturated like skin)
+    sat_mask = cv2.inRange(s, 30, 200)
+    
+    # Value: darker than bright skin/background (typically 30-220)
+    val_mask = cv2.inRange(v, 30, 220)
+    
+    # Combine: must match hue AND saturation AND value
+    hair_candidates = cv2.bitwise_and(cv2.bitwise_and(hue_mask, sat_mask), val_mask)
+    
+    # Morphological cleanup: close small gaps, remove noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    hair_mask = cv2.morphologyEx(hair_candidates, cv2.MORPH_CLOSE, kernel, iterations=2)
+    
+    print("[detect_hair_regions] Hair mask computed")
+    return hair_mask
+
+def remove_bg_preserve_hair(original_rgb: Image.Image, session) -> Image.Image:
+    """Remove background using rembg but preserve detected hair regions.
+    Combines u2net removal with HSV-based hair detection to recover lost hair."""
+    rgb_arr = np.array(original_rgb)
+    
+    # Detect hair regions
+    hair_mask = detect_hair_regions(rgb_arr)  # 0-255, 255=hair
+    
+    # Standard rembg removal
+    clean_rgba = remove(original_rgb, session=session).convert("RGBA")
+    alpha = np.array(clean_rgba.split()[3])  # 0-255, 255=keep
+    
+    # Force hair regions to be kept: merge hair_mask with rembg alpha
+    # This ensures hair isn't removed even if rembg classified it as background
+    alpha = np.maximum(alpha, hair_mask)
+    
+    # Apply modified alpha back to image
+    result = clean_rgba.copy()
+    result.putalpha(Image.fromarray(alpha))
+    
+    print("[remove_bg_preserve_hair] Hair regions preserved in alpha")
+    return result
 
 def guided_filter_alpha(guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 6, eps: float = 1e-3) -> np.ndarray:
     """Edge-aware alpha mask refinement using guided filter.
@@ -90,7 +138,6 @@ def guided_filter_alpha(guide_gray: np.ndarray, alpha: np.ndarray, radius: int =
     q = mean_a * I + mean_b
     return np.clip(q * 255, 0, 255).astype(np.uint8)
 
-
 def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Image:
     """Apply guided filter to rembg's alpha mask using original image as guide.
     Eliminates fringing and sharpens hair/skin boundary without touching the face content."""
@@ -100,7 +147,6 @@ def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Im
     result = clean_rgba.copy()
     result.putalpha(Image.fromarray(alpha_refined))
     return result
-
 
 def on_black(clean_rgba: Image.Image) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
@@ -123,7 +169,6 @@ def on_black(clean_rgba: Image.Image) -> Image.Image:
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(rgb, mask=alpha)
     return result
-
 
 def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
@@ -151,7 +196,6 @@ def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.I
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(duotone, mask=Image.fromarray(alpha_arr, mode="L"))
     return result
-
 
 def compute_redness_score(clean_rgba: Image.Image) -> int:
     """Absolute erythema score 0-100 using Lab a* channel.
@@ -187,7 +231,6 @@ def compute_redness_score(clean_rgba: Image.Image) -> int:
     ei_n = np.clip(ei / REDNESS_MAX, 0.0, 1.0)
 
     return int(ei_n[skin_mask].mean() * 100)
-
 
 def compute_texture_score(clean_rgba: Image.Image) -> int:
     """Texture severity score 0-100.
@@ -241,20 +284,15 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
     p75 = np.percentile(tm_face, 75)
     return int(min(100, float(tm_face[tm_face >= max(p75, 0.01)].mean()) * 100))
 
-
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-
 
 def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = Image.open(BytesIO(img_data)).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
-    # alpha_matting=True: trimap-based matting preserves fine hair strands u2net would clip.
-    # Falls back to standard removal if pymatting is unavailable.
-    # Alpha matting disabled: pymatting Cholesky decomposition fails repeatedly on most inputs,
-    # adding ~15–20s of wasted retries per scan. The guided filter below handles edge cleanup.
-    clean_rgba = remove(original, session=session).convert("RGBA")
-    print("[process_single] Background removed")
+    # Hair-aware background removal: uses rembg + HSV hair detection to preserve hair
+    clean_rgba = remove_bg_preserve_hair(original, session)
+    print("[process_single] Background removed with hair preservation")
     # Guided filter: snaps soft matting edges to actual image boundaries (fixes fringing)
     clean_rgba = refine_alpha(original, clean_rgba)
     uid = uuid.uuid4().hex[:8]
@@ -288,7 +326,6 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
             "visia_image_url": f_visia.result(),
             "redness_score":   redness_score,
         }
-
 
 def handler(job):
     import traceback
