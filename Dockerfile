@@ -9,9 +9,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Modell vorab laden für Speed
-RUN mkdir -p /root/.u2net && \
-    curl -L https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx -o /root/.u2net/u2net.onnx
+# Modelle vorab laden für Speed und Offline-Fallback
+RUN mkdir -p /root/.u2net /root/.modnet && \
+    curl -L https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx -o /root/.u2net/u2net.onnx && \
+    curl -L https://github.com/yakhyo/modnet/releases/download/weights/modnet_photographic.onnx -o /root/.modnet/modnet_photographic.onnx && \
+    echo "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae  /root/.modnet/modnet_photographic.onnx" | sha256sum -c -
 
 COPY handler.py .
 CMD ["python", "-u", "handler.py"]
