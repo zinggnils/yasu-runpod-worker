@@ -3,7 +3,9 @@ import base64
 import os
 import uuid
 import requests
+import hashlib
 from io import BytesIO
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageFilter
 import numpy as np
@@ -18,12 +20,85 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = "scans"
 
+ORT_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+BG_REMOVAL_BACKEND = os.environ.get("BG_REMOVAL_BACKEND", "modnet").strip().lower()
+MODNET_MODEL_URL = os.environ.get(
+    "MODNET_MODEL_URL",
+    "https://github.com/yakhyo/modnet/releases/download/weights/modnet_photographic.onnx",
+)
+MODNET_MODEL_PATH = os.environ.get("MODNET_MODEL_PATH", "/root/.modnet/modnet_photographic.onnx")
+MODNET_MODEL_SHA256 = os.environ.get(
+    "MODNET_MODEL_SHA256",
+    "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae",
+).strip().lower()
+MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
+
+
+def active_ort_providers() -> list:
+    available = set(ort.get_available_providers())
+    providers = [provider for provider in ORT_PROVIDERS if provider in available]
+    return providers or ["CPUExecutionProvider"]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_modnet_model() -> str:
+    model_path = Path(MODNET_MODEL_PATH)
+    if model_path.exists() and model_path.stat().st_size > 0:
+        if MODNET_MODEL_SHA256 and sha256_file(model_path) != MODNET_MODEL_SHA256:
+            print(f"[modnet] Cached model checksum mismatch, refreshing {model_path}")
+            model_path.unlink()
+        else:
+            return str(model_path)
+
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
+    print(f"[modnet] Downloading model to {model_path}")
+    with requests.get(MODNET_MODEL_URL, stream=True, timeout=(10, 240)) as resp:
+        resp.raise_for_status()
+        with tmp_path.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+
+    if MODNET_MODEL_SHA256 and sha256_file(tmp_path) != MODNET_MODEL_SHA256:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("Downloaded MODNet model checksum mismatch")
+
+    tmp_path.replace(model_path)
+    return str(model_path)
+
+
+def init_modnet_session():
+    if BG_REMOVAL_BACKEND in {"rembg", "u2net"}:
+        print(f"[modnet] Disabled by BG_REMOVAL_BACKEND={BG_REMOVAL_BACKEND}")
+        return None
+
+    try:
+        model_path = ensure_modnet_model()
+        providers = active_ort_providers()
+        sess = ort.InferenceSession(model_path, providers=providers)
+        print(f"[modnet] Session initialized with providers={sess.get_providers()}")
+        return sess
+    except Exception as e:
+        print(f"[modnet] Initialization failed, rembg fallback will be used: {e}")
+        return None
+
+
 try:
-    session = new_session("u2net", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    session = new_session("u2net", providers=active_ort_providers())
     print("Rembg session initialized with CUDA/CPU.")
 except Exception as e:
     print(f"Failed to initialize GPU session, falling back: {e}")
     session = new_session("u2net")
+
+modnet_session = init_modnet_session()
 
 def upload_to_supabase(img: Image.Image, filename: str) -> str:
     buf = BytesIO()
@@ -61,60 +136,59 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, frontal: dict,
     if resp.status_code not in (200, 201, 204):
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
-def detect_hair_regions(rgb: np.ndarray) -> np.ndarray:
-    """Detect hair regions using HSV color + texture analysis.
-    Hair is typically darker, moderately saturated, and has Hue 0-30 or 330-360 (browns/reds).
-    Returns a binary mask (0-255, 255=hair detected)."""
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    h, s, v = cv2.split(hsv)
-    
-    # Hair: Brown/Red hues (0-30 or 330-360) + moderate saturation + darker value
-    hue_mask1 = cv2.inRange(h, 0, 30)      # Red-brown range
-    hue_mask2 = cv2.inRange(h, 330, 360)   # Brown wrapping around
-    hue_mask = cv2.bitwise_or(hue_mask1, hue_mask2)
-    
-    # Saturation: moderate (hair isn't fully desaturated like skin)
-    sat_mask = cv2.inRange(s, 30, 200)
-    
-    # Value: darker than bright skin/background (typically 30-220)
-    val_mask = cv2.inRange(v, 30, 220)
-    
-    # Combine: must match hue AND saturation AND value
-    hair_candidates = cv2.bitwise_and(cv2.bitwise_and(hue_mask, sat_mask), val_mask)
-    
-    # Morphological cleanup: close small gaps, remove noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    hair_mask = cv2.morphologyEx(hair_candidates, cv2.MORPH_CLOSE, kernel, iterations=2)
-    
-    print("[detect_hair_regions] Hair mask computed")
-    return hair_mask
+def modnet_target_size(width: int, height: int, session) -> tuple:
+    input_shape = session.get_inputs()[0].shape
+    if len(input_shape) == 4 and isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
+        return input_shape[3], input_shape[2]
 
-def remove_bg_preserve_hair(original_rgb: Image.Image, session) -> Image.Image:
-    """Remove background using rembg but preserve detected hair regions.
-    Combines u2net removal with HSV-based hair detection to recover lost hair."""
-    rgb_arr = np.array(original_rgb)
-    
-    # Detect hair regions
-    hair_mask = detect_hair_regions(rgb_arr)  # 0-255, 255=hair
-    
-    # Standard rembg removal
-    clean_rgba = remove(original_rgb, session=session).convert("RGBA")
-    alpha = np.array(clean_rgba.split()[3])  # 0-255, 255=keep
-    
-    # Force hair regions to be kept: merge hair_mask with rembg alpha
-    # This ensures hair isn't removed even if rembg classified it as background
-    alpha = np.maximum(alpha, hair_mask)
-    
-    # Apply modified alpha back to image
-    result = clean_rgba.copy()
-    result.putalpha(Image.fromarray(alpha))
-    
-    print("[remove_bg_preserve_hair] Hair regions preserved in alpha")
+    if max(width, height) < MODNET_INPUT_SIZE or min(width, height) > MODNET_INPUT_SIZE:
+        if width >= height:
+            new_h = MODNET_INPUT_SIZE
+            new_w = int(width / height * MODNET_INPUT_SIZE)
+        else:
+            new_w = MODNET_INPUT_SIZE
+            new_h = int(height / width * MODNET_INPUT_SIZE)
+    else:
+        new_w, new_h = width, height
+
+    return max(32, new_w - (new_w % 32)), max(32, new_h - (new_h % 32))
+
+
+def run_modnet(original_rgb: Image.Image, session) -> Image.Image:
+    rgb_arr = np.array(original_rgb.convert("RGB"))
+    height, width = rgb_arr.shape[:2]
+    target_w, target_h = modnet_target_size(width, height, session)
+
+    resized = cv2.resize(rgb_arr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    tensor = resized.astype(np.float32) / 255.0
+    tensor = (tensor - 0.5) / 0.5
+    tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
+
+    input_name = session.get_inputs()[0].name
+    output_names = [output.name for output in session.get_outputs()]
+    matte = session.run(output_names, {input_name: tensor})[0]
+    matte = np.squeeze(matte)
+    matte = cv2.resize(matte, (width, height), interpolation=cv2.INTER_LINEAR)
+    alpha = np.clip(matte * 255.0, 0, 255).astype(np.uint8)
+
+    result = original_rgb.convert("RGBA")
+    result.putalpha(Image.fromarray(alpha, mode="L"))
+    print("[run_modnet] Background matte generated")
     return result
+
+
+def remove_background(original_rgb: Image.Image) -> Image.Image:
+    if modnet_session is not None:
+        try:
+            return run_modnet(original_rgb, modnet_session)
+        except Exception as e:
+            print(f"[remove_background] MODNet failed, using rembg fallback: {e}")
+
+    return remove(original_rgb, session=session).convert("RGBA")
 
 def guided_filter_alpha(guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 6, eps: float = 1e-3) -> np.ndarray:
     """Edge-aware alpha mask refinement using guided filter.
-    Snaps rembg's upsampled mask edges to actual image boundaries — fixes fringing and jagged hair edges."""
+    Snaps soft mask edges to actual image boundaries to reduce fringing."""
     def box(I, r):
         return cv2.boxFilter(I.astype(np.float32), -1, (2 * r + 1, 2 * r + 1))
 
@@ -140,7 +214,7 @@ def guided_filter_alpha(guide_gray: np.ndarray, alpha: np.ndarray, radius: int =
 
 def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Image:
     """Apply guided filter to rembg's alpha mask using original image as guide.
-    Eliminates fringing and sharpens hair/skin boundary without touching the face content."""
+    Eliminates fringing and sharpens detailed alpha boundaries."""
     gray = cv2.cvtColor(np.array(original_rgb.convert("RGB")), cv2.COLOR_RGB2GRAY)
     alpha = np.array(clean_rgba.split()[3])
     alpha_refined = guided_filter_alpha(gray, alpha, radius=6, eps=1e-3)
@@ -290,10 +364,9 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = Image.open(BytesIO(img_data)).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
-    # Hair-aware background removal: uses rembg + HSV hair detection to preserve hair
-    clean_rgba = remove_bg_preserve_hair(original, session)
-    print("[process_single] Background removed with hair preservation")
-    # Guided filter: snaps soft matting edges to actual image boundaries (fixes fringing)
+    clean_rgba = remove_background(original)
+    print("[process_single] Background removed")
+    # Guided filter: snaps soft matting edges to actual image boundaries
     clean_rgba = refine_alpha(original, clean_rgba)
     uid = uuid.uuid4().hex[:8]
     clean_img = on_black(clean_rgba)
