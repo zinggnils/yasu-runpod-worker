@@ -371,6 +371,10 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     uid = uuid.uuid4().hex[:8]
     clean_img = on_black(clean_rgba)
 
+    if mode == "before_after":
+        clean_url = upload_to_supabase(clean_img, f"clean_{label}_{uid}.webp")
+        return {"clean_image_url": clean_url}
+
     if mode == "texture":
         visia_img = make_visia_duotone(clean_rgba, invert=True)
         texture_score = compute_texture_score(clean_rgba)
@@ -384,9 +388,6 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
                 "texture_score":   texture_score,
             }
 
-    # ── Default: redness flow ──
-    # Score computed from raw skin signal; no overlay images generated.
-    # Left panel = clean photo on black, right panel = BONE duotone.
     visia_img = make_visia_duotone(clean_rgba)
     redness_score = compute_redness_score(clean_rgba)
     print(f"[process_single] redness_score={redness_score}")
@@ -452,29 +453,29 @@ def handler(job):
             try:
                 frontal = processed_angles.get("frontal", {})
 
-                # Overall redness score: frontal + 45° angles show the cheek butterfly
-                # pattern most directly. 90° profiles see redness obliquely and underreport.
-                redness_vals = [
-                    s for s in [
-                        processed_angles.get("frontal",   {}).get("redness_score"),
-                        processed_angles.get("left_45",   {}).get("redness_score"),
-                        processed_angles.get("right_45",  {}).get("redness_score"),
-                    ] if isinstance(s, (int, float))
-                ]
-                overall_score = int(sum(redness_vals) / len(redness_vals)) if redness_vals else 0
-                print(f"[handler] overall_redness_score={overall_score} (frontal+45°)")
+                if mode == "before_after":
+                    overall_score = 0
+                    overall_texture = 0
+                else:
+                    redness_vals = [
+                        s for s in [
+                            processed_angles.get("frontal",   {}).get("redness_score"),
+                            processed_angles.get("left_45",   {}).get("redness_score"),
+                            processed_angles.get("right_45",  {}).get("redness_score"),
+                        ] if isinstance(s, (int, float))
+                    ]
+                    overall_score = int(sum(redness_vals) / len(redness_vals)) if redness_vals else 0
+                    print(f"[handler] overall_redness_score={overall_score} (frontal+45°)")
 
-                # Overall texture score: same angles — pores/scars face forward,
-                # foreshortened at 90° profile so frontal+45° give the clearest read.
-                texture_vals = [
-                    s for s in [
-                        processed_angles.get("frontal",   {}).get("texture_score"),
-                        processed_angles.get("left_45",   {}).get("texture_score"),
-                        processed_angles.get("right_45",  {}).get("texture_score"),
-                    ] if isinstance(s, (int, float))
-                ]
-                overall_texture = int(sum(texture_vals) / len(texture_vals)) if texture_vals else 0
-                print(f"[handler] overall_texture_score={overall_texture} (frontal+45°)")
+                    texture_vals = [
+                        s for s in [
+                            processed_angles.get("frontal",   {}).get("texture_score"),
+                            processed_angles.get("left_45",   {}).get("texture_score"),
+                            processed_angles.get("right_45",  {}).get("texture_score"),
+                        ] if isinstance(s, (int, float))
+                    ]
+                    overall_texture = int(sum(texture_vals) / len(texture_vals)) if texture_vals else 0
+                    print(f"[handler] overall_texture_score={overall_texture} (frontal+45°)")
 
                 update_supabase_scan(scan_id, processed_angles, frontal, overall_score, overall_texture)
                 print(f"[handler] DB updated OK for scan_id={scan_id}")
