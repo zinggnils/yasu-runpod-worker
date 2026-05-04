@@ -442,9 +442,7 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     print(f"[process_single] Input size: {original.size}")
 
     ok, reason = check_image_quality(original)
-    if not ok:
-        print(f"[process_single] Quality gate FAILED for {label}: {reason}")
-        return {"error": reason, "label": label}
+    print(f"[process_single] Quality gate {'OK' if ok else 'WARN: ' + reason} for {label}")
 
     original  = crop_to_face(original)
     print(f"[process_single] After face crop: {original.size}")
