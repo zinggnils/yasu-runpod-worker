@@ -7,7 +7,7 @@ import hashlib
 from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 import numpy as np
 import cv2
 import onnxruntime as ort
@@ -438,13 +438,14 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str]:
 
 def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data  = base64.b64decode(image_b64)
-    original  = Image.open(BytesIO(img_data)).convert("RGB")
+    original  = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
 
     ok, reason = check_image_quality(original)
     if not ok:
         print(f"[process_single] Quality gate FAILED for {label}: {reason}")
         return {"error": reason, "label": label}
+    print(f"[process_single] Quality gate passed")
 
     original  = crop_to_face(original)
     print(f"[process_single] After face crop: {original.size}")
