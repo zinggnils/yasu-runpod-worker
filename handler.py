@@ -360,10 +360,94 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 
+def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
+    """MediaPipe face detection crop — handles frontal and profile angles.
+    Falls back to center crop if no face detected."""
+    import mediapipe as mp
+
+    rgb = np.array(img.convert("RGB"))
+    h, w = rgb.shape[:2]
+
+    with mp.solutions.face_detection.FaceDetection(
+        model_selection=1,  # model 1 = full-range, better for profile angles
+        min_detection_confidence=0.4,
+    ) as detector:
+        results = detector.process(rgb)
+
+    if not results.detections:
+        side = min(w, h)
+        left = (w - side) // 2
+        top = max(0, min((h - side) // 2 - int(h * 0.05), h - side))
+        print(f"[crop_to_face] No face detected, center crop {side}×{side}")
+        return img.crop((left, top, left + side, top + side)).resize((800, 800), Image.LANCZOS)
+
+    detection = results.detections[0]
+    bb = detection.location_data.relative_bounding_box
+    x1 = max(0, int(bb.xmin * w))
+    y1 = max(0, int(bb.ymin * h))
+    x2 = min(w, int((bb.xmin + bb.width) * w))
+    y2 = min(h, int((bb.ymin + bb.height) * h))
+
+    fw, fh = x2 - x1, y2 - y1
+    mx, my = int(fw * margin), int(fh * margin)
+    x1 = max(0, x1 - mx); y1 = max(0, y1 - my)
+    x2 = min(w, x2 + mx); y2 = min(h, y2 + my)
+
+    cx_face, cy_face = (x1 + x2) // 2, (y1 + y2) // 2
+    side = max(x2 - x1, y2 - y1)
+    half = side // 2
+    x1 = max(0, cx_face - half); x2 = min(w, x1 + side)
+    y1 = max(0, cy_face - half); y2 = min(h, y1 + side)
+    if x2 - x1 < side: x1 = max(0, x2 - side)
+    if y2 - y1 < side: y1 = max(0, y2 - side)
+
+    print(f"[crop_to_face] MediaPipe detected face, crop ({x1},{y1})-({x2},{y2})")
+    return img.crop((x1, y1, x2, y2)).resize((800, 800), Image.LANCZOS)
+
+
+def check_image_quality(img: Image.Image) -> tuple[bool, str]:
+    """Returns (ok, reason). Rejects blurry images and images with no face."""
+    import mediapipe as mp
+
+    rgb = np.array(img.convert("RGB"))
+    h, w = rgb.shape[:2]
+
+    # Blur check: Laplacian variance on centre crop
+    cx, cy = w // 2, h // 2
+    crop_size = min(w, h) // 2
+    centre = rgb[cy - crop_size//2:cy + crop_size//2, cx - crop_size//2:cx + crop_size//2]
+    gray = cv2.cvtColor(centre, cv2.COLOR_RGB2GRAY)
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    print(f"[quality_gate] blur_score={blur_score:.1f}")
+    if blur_score < 40:
+        return False, f"Image too blurry (score={blur_score:.0f}, min=40)"
+
+    # Face presence check
+    with mp.solutions.face_detection.FaceDetection(
+        model_selection=1,
+        min_detection_confidence=0.35,
+    ) as detector:
+        results = detector.process(rgb)
+
+    if not results.detections:
+        return False, "No face detected in image"
+
+    print(f"[quality_gate] OK — blur={blur_score:.0f}, face detected")
+    return True, "ok"
+
+
 def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = Image.open(BytesIO(img_data)).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
+
+    ok, reason = check_image_quality(original)
+    if not ok:
+        print(f"[process_single] Quality gate FAILED for {label}: {reason}")
+        return {"error": reason, "label": label}
+
+    original  = crop_to_face(original)
+    print(f"[process_single] After face crop: {original.size}")
     clean_rgba = remove_background(original)
     print("[process_single] Background removed")
     # Guided filter: snaps soft matting edges to actual image boundaries
