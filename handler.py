@@ -436,8 +436,13 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str]:
     return True, "ok"
 
 
-def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
-    img_data  = base64.b64decode(image_b64)
+def process_single(image_b64_or_url: str, label: str, mode: str = "redness") -> dict:
+    if image_b64_or_url.startswith("http"):
+        resp = requests.get(image_b64_or_url, timeout=30)
+        resp.raise_for_status()
+        img_data = resp.content
+    else:
+        img_data = base64.b64decode(image_b64_or_url)
     original  = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
 
