@@ -5,3 +5,4 @@ rembg
 pymatting
 onnxruntime-gpu==1.17.1
 opencv-python-headless
+mediapipe==0.10.14
