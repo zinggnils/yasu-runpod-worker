@@ -40,6 +40,10 @@ MODNET_MODEL_SHA256 = os.environ.get(
     "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae",
 ).strip().lower()
 MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
+TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "2048"))
+UPSCALE_FACTOR = float(os.environ.get("UPSCALE_FACTOR", "2.0"))
+UPSCALE_TRIGGER_PX = int(os.environ.get("UPSCALE_TRIGGER_PX", "1024"))
+SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
 
 
 def active_ort_providers() -> list:
@@ -240,13 +244,14 @@ def on_black(clean_rgba: Image.Image) -> Image.Image:
     # makes skin texture, pores and fine detail visually pop without over-sharpening edges.
     arr = np.array(rgb).astype(np.float32)
     blur_large = cv2.GaussianBlur(arr, (0, 0), sigmaX=30)
-    # strength=0.45 ≈ Lightroom Clarity +40 / Adobe Express texture boost
-    arr_clarity = np.clip(arr + (arr - blur_large) * 0.45, 0, 255).astype(np.uint8)
+    clarity_strength = 0.18 * SHARPEN_AMOUNT
+    arr_clarity = np.clip(arr + (arr - blur_large) * clarity_strength, 0, 255).astype(np.uint8)
     rgb = Image.fromarray(arr_clarity)
 
     # ── Step 2: Fine sharpening pass ──
     # Crispens edges and fine lines — radius=1.5, percent=220 ≈ Adobe Express Sharpen +25
-    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=220, threshold=1))
+    unsharp_percent = max(100, int(100 * SHARPEN_AMOUNT))
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.3, percent=unsharp_percent, threshold=1))
 
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(rgb, mask=alpha)
@@ -274,7 +279,8 @@ def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.I
         bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
         duotone = Image.fromarray(cv2.cvtColor(bone, cv2.COLOR_BGR2RGB), mode="RGB")
 
-    duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.5, percent=200, threshold=1))
+    duotone_percent = max(100, int(100 * SHARPEN_AMOUNT))
+    duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.3, percent=duotone_percent, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(duotone, mask=Image.fromarray(alpha_arr, mode="L"))
     return result
@@ -583,7 +589,11 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
         left = (w - side) // 2
         top = max(0, min((h - side) // 2 - int(h * 0.05), h - side))
         print(f"[crop_to_face] No face detected, center crop {side}×{side}")
-        return img.crop((left, top, left + side, top + side)).resize((800, 800), Image.LANCZOS)
+        crop = img.crop((left, top, left + side, top + side))
+        scale = UPSCALE_FACTOR if side < UPSCALE_TRIGGER_PX else 1.0
+        out_px = min(TARGET_MAX_PX, int(side * scale))
+        out_px = max(800, out_px)
+        return crop.resize((out_px, out_px), Image.LANCZOS)
 
     detection = results.detections[0]
     bb = detection.location_data.relative_bounding_box
@@ -606,7 +616,12 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     if y2 - y1 < side: y1 = max(0, y2 - side)
 
     print(f"[crop_to_face] MediaPipe detected face, crop ({x1},{y1})-({x2},{y2})")
-    return img.crop((x1, y1, x2, y2)).resize((800, 800), Image.LANCZOS)
+    crop = img.crop((x1, y1, x2, y2))
+    side = max(1, x2 - x1)
+    scale = UPSCALE_FACTOR if side < UPSCALE_TRIGGER_PX else 1.0
+    out_px = min(TARGET_MAX_PX, int(side * scale))
+    out_px = max(800, out_px)
+    return crop.resize((out_px, out_px), Image.LANCZOS)
 
 
 def check_image_quality(img: Image.Image) -> tuple[bool, str]:
