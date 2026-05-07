@@ -12,6 +12,14 @@ import numpy as np
 import cv2
 import onnxruntime as ort
 from rembg import new_session, remove
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+    print(f"[startup] mediapipe version={mp.__version__}")
+except Exception as e:
+    mp = None
+    MEDIAPIPE_AVAILABLE = False
+    print(f"[startup] mediapipe unavailable: {e}")
 
 print(f"ORT version: {ort.__version__}")  # build trigger
 print(f"Available providers: {ort.get_available_providers()}")
@@ -359,11 +367,207 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
     return int(min(100, float(tm_face[tm_face >= max(p75, 0.01)].mean()) * 100))
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
+REQUIRED_ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
+ALIGNMENT_MAX_DELTA = float(os.environ.get("ALIGNMENT_MAX_DELTA", "0.10"))
+
+
+def _supabase_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def _subject_metrics_for_alignment(img_rgb: Image.Image, clean_rgba: Image.Image) -> dict | None:
+    """Compute alignment metrics from face bbox + shoulder width."""
+    if not MEDIAPIPE_AVAILABLE or mp is None:
+        return None
+
+    rgb = np.array(img_rgb.convert("RGB"))
+    h, w = rgb.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+
+    with mp.solutions.face_detection.FaceDetection(
+        model_selection=1,
+        min_detection_confidence=0.35,
+    ) as detector:
+        results = detector.process(rgb)
+
+    if not results.detections:
+        return None
+
+    bb = results.detections[0].location_data.relative_bounding_box
+    face_cx = float(bb.xmin + bb.width * 0.5)
+    face_cy = float(bb.ymin + bb.height * 0.5)
+    face_w = float(bb.width)
+
+    alpha = np.array(clean_rgba.convert("RGBA").split()[3])
+    alpha_mask = alpha > 18
+    if not np.any(alpha_mask):
+        return None
+
+    # Shoulder estimate from lower torso band (robust for profile and frontal).
+    y1 = int(alpha.shape[0] * 0.64)
+    y2 = int(alpha.shape[0] * 0.86)
+    band = alpha_mask[y1:y2, :]
+    row_widths = np.sum(band, axis=1).astype(np.float32)
+    if row_widths.size == 0:
+        return None
+
+    shoulder_w_px = float(np.percentile(row_widths, 80))
+    shoulder_w = shoulder_w_px / float(alpha.shape[1])
+
+    return {
+        "face_cx": face_cx,
+        "face_cy": face_cy,
+        "face_w": face_w,
+        "shoulder_w": shoulder_w,
+    }
+
+
+def _load_image_from_url(url: str) -> Image.Image:
+    resp = requests.get(url, timeout=(10, 60))
+    resp.raise_for_status()
+    return ImageOps.exif_transpose(Image.open(BytesIO(resp.content))).convert("RGB")
+
+
+def _fetch_scan_context(scan_id: str) -> dict | None:
+    if not scan_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/scans"
+    params = {
+        "id": f"eq.{scan_id}",
+        "select": "id,patient_id,created_at,mode",
+        "limit": "1",
+    }
+    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
+    if resp.status_code != 200:
+        print(f"[align] scan context fetch failed: {resp.status_code} {resp.text[:200]}")
+        return None
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+def _fetch_baseline_scan(scan_context: dict) -> dict | None:
+    """Baseline is the first completed scan for this patient (excluding current)."""
+    patient_id = scan_context.get("patient_id")
+    current_id = scan_context.get("id")
+    if not patient_id:
+        return None
+
+    url = f"{SUPABASE_URL}/rest/v1/scans"
+    params = {
+        "patient_id": f"eq.{patient_id}",
+        "status": "eq.done",
+        "select": "id,created_at,processed_angles",
+        "order": "created_at.asc",
+        "limit": "50",
+    }
+    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
+    if resp.status_code != 200:
+        print(f"[align] baseline fetch failed: {resp.status_code} {resp.text[:200]}")
+        return None
+
+    for row in resp.json():
+        if row.get("id") == current_id:
+            continue
+        angles = row.get("processed_angles")
+        if isinstance(angles, dict) and any(
+            isinstance(angles.get(k), dict) and angles.get(k, {}).get("clean_image_url")
+            for k in ANGLE_KEYS
+        ):
+            return row
+    return None
+
+
+def _build_alignment_baselines(scan_id: str) -> dict:
+    """Return per-angle baseline metrics derived from baseline clean images."""
+    scan_context = _fetch_scan_context(scan_id)
+    if not scan_context:
+        print("[align] No scan context; skipping baseline alignment")
+        return {}
+
+    baseline_scan = _fetch_baseline_scan(scan_context)
+    if not baseline_scan:
+        print("[align] No prior completed baseline scan found")
+        return {}
+
+    baseline_angles = baseline_scan.get("processed_angles") or {}
+    baselines = {}
+    for key in ANGLE_KEYS:
+        clean_url = (baseline_angles.get(key) or {}).get("clean_image_url")
+        if not clean_url:
+            continue
+        try:
+            baseline_rgb = _load_image_from_url(clean_url)
+            baseline_rgba = baseline_rgb.convert("RGBA")
+            baseline_metrics = _subject_metrics_for_alignment(baseline_rgb, baseline_rgba)
+            if baseline_metrics:
+                baselines[key] = baseline_metrics
+        except Exception as e:
+            print(f"[align] Failed baseline metric extraction for {key}: {e}")
+    print(f"[align] Baseline metrics ready for angles={list(baselines.keys())}")
+    return baselines
+
+
+def _apply_alignment(clean_rgba: Image.Image, scale: float, dx_px: float, dy_px: float) -> Image.Image:
+    w, h = clean_rgba.size
+    scaled_w = max(8, int(round(w * scale)))
+    scaled_h = max(8, int(round(h * scale)))
+    scaled = clean_rgba.resize((scaled_w, scaled_h), Image.LANCZOS)
+
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    x = int(round((w - scaled_w) * 0.5 + dx_px))
+    y = int(round((h - scaled_h) * 0.5 + dy_px))
+    canvas.alpha_composite(scaled, (x, y))
+    return canvas
+
+
+def _align_to_baseline(
+    original_rgb: Image.Image,
+    clean_rgba: Image.Image,
+    baseline_metrics: dict,
+    angle_label: str,
+) -> tuple[Image.Image, dict]:
+    current_metrics = _subject_metrics_for_alignment(original_rgb, clean_rgba)
+    if not current_metrics:
+        raise RuntimeError(f"{angle_label}: could not compute face/shoulder metrics for alignment")
+
+    face_scale = baseline_metrics["face_w"] / max(1e-6, current_metrics["face_w"])
+    shoulder_scale = baseline_metrics["shoulder_w"] / max(1e-6, current_metrics["shoulder_w"])
+    scale = face_scale * 0.6 + shoulder_scale * 0.4
+
+    # After scaling around center, move to match baseline face center.
+    w, h = clean_rgba.size
+    dx_norm = baseline_metrics["face_cx"] - current_metrics["face_cx"]
+    dy_norm = baseline_metrics["face_cy"] - current_metrics["face_cy"]
+    dx_px = dx_norm * w
+    dy_px = dy_norm * h
+
+    scale_delta = abs(scale - 1.0)
+    if scale_delta > ALIGNMENT_MAX_DELTA or abs(dx_norm) > ALIGNMENT_MAX_DELTA or abs(dy_norm) > ALIGNMENT_MAX_DELTA:
+        raise RuntimeError(
+            f"{angle_label}: alignment exceeds +/-{int(ALIGNMENT_MAX_DELTA * 100)}% "
+            f"(scale={scale:.3f}, dx={dx_norm:.3f}, dy={dy_norm:.3f}). Retake required."
+        )
+
+    aligned = _apply_alignment(clean_rgba, scale, dx_px, dy_px)
+    info = {
+        "applied": True,
+        "scale": round(scale, 5),
+        "dx": round(dx_norm, 5),
+        "dy": round(dy_norm, 5),
+        "max_delta": ALIGNMENT_MAX_DELTA,
+    }
+    return aligned, info
 
 def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     """MediaPipe face detection crop — handles frontal and profile angles.
     Falls back to center crop if no face detected."""
-    import mediapipe as mp
+    if not MEDIAPIPE_AVAILABLE or mp is None:
+        raise RuntimeError("mediapipe is required for face crop but is not available")
 
     rgb = np.array(img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -407,7 +611,8 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
 
 def check_image_quality(img: Image.Image) -> tuple[bool, str]:
     """Returns (ok, reason). Rejects blurry images and images with no face."""
-    import mediapipe as mp
+    if not MEDIAPIPE_AVAILABLE or mp is None:
+        raise RuntimeError("mediapipe is required for quality checks but is not available")
 
     rgb = np.array(img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -436,7 +641,7 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str]:
     return True, "ok"
 
 
-def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
+def process_single(image_b64: str, label: str, mode: str = "redness", baseline_metrics: dict | None = None) -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
@@ -450,12 +655,16 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
     print("[process_single] Background removed")
     # Guided filter: snaps soft matting edges to actual image boundaries
     clean_rgba = refine_alpha(original, clean_rgba)
+    alignment_info = {"applied": False}
+    if baseline_metrics is not None:
+        clean_rgba, alignment_info = _align_to_baseline(original, clean_rgba, baseline_metrics, label)
+        print(f"[process_single] {label} alignment applied: {alignment_info}")
     uid = uuid.uuid4().hex[:8]
     clean_img = on_black(clean_rgba)
 
     if mode == "before_after":
         clean_url = upload_to_supabase(clean_img, f"clean_{label}_{uid}.webp")
-        return {"clean_image_url": clean_url}
+        return {"clean_image_url": clean_url, "alignment": alignment_info}
 
     if mode == "texture":
         visia_img = make_visia_duotone(clean_rgba, invert=True)
@@ -468,6 +677,7 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
                 "clean_image_url": f_clean.result(),
                 "visia_image_url": f_visia.result(),
                 "texture_score":   texture_score,
+                "alignment": alignment_info,
             }
 
     visia_img = make_visia_duotone(clean_rgba)
@@ -481,6 +691,7 @@ def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
             "clean_image_url": f_clean.result(),
             "visia_image_url": f_visia.result(),
             "redness_score":   redness_score,
+            "alignment": alignment_info,
         }
 
 def handler(job):
@@ -505,6 +716,7 @@ def handler(job):
     print(f"[handler] mode={mode}")
 
     if images and isinstance(images, dict):
+        alignment_baselines = _build_alignment_baselines(scan_id) if scan_id else {}
         def process_angle(key):
             b64 = images.get(key)
             if not b64:
@@ -512,7 +724,12 @@ def handler(job):
                 return key, None
             print(f"[handler] Processing {key}, b64 length={len(b64)}")
             try:
-                result = process_single(b64, key, mode=mode)
+                result = process_single(
+                    b64,
+                    key,
+                    mode=mode,
+                    baseline_metrics=alignment_baselines.get(key),
+                )
                 score_log = result.get('redness_score') if result.get('redness_score') is not None else result.get('texture_score')
                 print(f"[handler] {key} OK — score={score_log}")
                 return key, result
@@ -530,6 +747,17 @@ def handler(job):
                     processed_angles[key] = result
 
         print(f"[handler] Processed angles: {list(processed_angles.keys())}")
+        failed_angles = []
+        for key in REQUIRED_ANGLE_KEYS:
+            result = processed_angles.get(key)
+            if result is None or result.get("error"):
+                failed_angles.append(key)
+        if failed_angles:
+            failed_detail = ", ".join(failed_angles)
+            raise RuntimeError(
+                f"Required angle processing failed for: {failed_detail}. "
+                "Rejecting scan to prevent low-quality/partial results."
+            )
 
         if scan_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
             try:

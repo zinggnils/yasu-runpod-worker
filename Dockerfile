@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN python -c "import mediapipe as mp; print('mediapipe', mp.__version__)"
 
 # Modelle vorab laden für Speed und Offline-Fallback
 RUN mkdir -p /root/.u2net /root/.modnet && \
