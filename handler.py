@@ -44,6 +44,8 @@ TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "2048"))
 UPSCALE_FACTOR = float(os.environ.get("UPSCALE_FACTOR", "2.0"))
 UPSCALE_TRIGGER_PX = int(os.environ.get("UPSCALE_TRIGGER_PX", "1024"))
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
+BLUR_MIN_SCORE = float(os.environ.get("BLUR_MIN_SCORE", "50"))
+QUALITY_MIN_CONFIDENCE = float(os.environ.get("QUALITY_MIN_CONFIDENCE", "0.35"))
 
 
 def active_ort_providers() -> list:
@@ -624,8 +626,8 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     return crop.resize((out_px, out_px), Image.LANCZOS)
 
 
-def check_image_quality(img: Image.Image) -> tuple[bool, str]:
-    """Returns (ok, reason). Rejects blurry images and images with no face."""
+def check_image_quality(img: Image.Image) -> tuple[bool, str, dict]:
+    """Returns (ok, reason, metrics). Rejects blurry images and images with no face."""
     if not MEDIAPIPE_AVAILABLE or mp is None:
         raise RuntimeError("mediapipe is required for quality checks but is not available")
 
@@ -639,8 +641,12 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str]:
     gray = cv2.cvtColor(centre, cv2.COLOR_RGB2GRAY)
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
     print(f"[quality_gate] blur_score={blur_score:.1f}")
-    if blur_score < 40:
-        return False, f"Image too blurry (score={blur_score:.0f}, min=40)"
+    if blur_score < BLUR_MIN_SCORE:
+        return False, f"Image too blurry (score={blur_score:.0f}, min={BLUR_MIN_SCORE:.0f})", {
+            "blur_score": float(blur_score),
+            "face_score": 0.0,
+            "confidence": 0.0,
+        }
 
     # Face presence check
     with mp.solutions.face_detection.FaceDetection(
@@ -650,10 +656,23 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str]:
         results = detector.process(rgb)
 
     if not results.detections:
-        return False, "No face detected in image"
+        return False, "No face detected in image", {
+            "blur_score": float(blur_score),
+            "face_score": 0.0,
+            "confidence": 0.0,
+        }
 
-    print(f"[quality_gate] OK — blur={blur_score:.0f}, face detected")
-    return True, "ok"
+    face_score = float(results.detections[0].score[0]) if results.detections[0].score else 0.0
+    blur_norm = float(np.clip((blur_score - BLUR_MIN_SCORE) / 110.0, 0.0, 1.0))
+    face_norm = float(np.clip((face_score - 0.35) / 0.65, 0.0, 1.0))
+    confidence = float(np.clip(0.65 * blur_norm + 0.35 * face_norm, 0.0, 1.0))
+    metrics = {
+        "blur_score": float(blur_score),
+        "face_score": face_score,
+        "confidence": confidence,
+    }
+    print(f"[quality_gate] OK — blur={blur_score:.0f}, face={face_score:.2f}, confidence={confidence:.2f}")
+    return True, "ok", metrics
 
 
 def process_single(image_b64: str, label: str, mode: str = "redness", baseline_metrics: dict | None = None) -> dict:
@@ -661,8 +680,15 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
     original  = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
 
-    ok, reason = check_image_quality(original)
+    ok, reason, quality_metrics = check_image_quality(original)
     print(f"[process_single] Quality gate {'OK' if ok else 'WARN: ' + reason} for {label}")
+    if not ok:
+        raise RuntimeError(f"{label}: {reason}")
+    if quality_metrics.get("confidence", 0.0) < QUALITY_MIN_CONFIDENCE:
+        raise RuntimeError(
+            f"{label}: unstable capture confidence={quality_metrics.get('confidence', 0.0):.2f} "
+            f"(min={QUALITY_MIN_CONFIDENCE:.2f})"
+        )
 
     original  = crop_to_face(original)
     print(f"[process_single] After face crop: {original.size}")
@@ -679,7 +705,7 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
 
     if mode == "before_after":
         clean_url = upload_to_supabase(clean_img, f"clean_{label}_{uid}.webp")
-        return {"clean_image_url": clean_url, "alignment": alignment_info}
+        return {"clean_image_url": clean_url, "alignment": alignment_info, "quality": quality_metrics}
 
     if mode == "texture":
         visia_img = make_visia_duotone(clean_rgba, invert=True)
@@ -693,6 +719,7 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
                 "visia_image_url": f_visia.result(),
                 "texture_score":   texture_score,
                 "alignment": alignment_info,
+                "quality": quality_metrics,
             }
 
     visia_img = make_visia_duotone(clean_rgba)
@@ -707,7 +734,23 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
             "visia_image_url": f_visia.result(),
             "redness_score":   redness_score,
             "alignment": alignment_info,
+            "quality": quality_metrics,
         }
+
+
+def weighted_angle_score(processed_angles: dict, angle_keys: list[str], score_key: str) -> int:
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for angle in angle_keys:
+        angle_result = processed_angles.get(angle, {})
+        score = angle_result.get(score_key)
+        if not isinstance(score, (int, float)):
+            continue
+        confidence = float((angle_result.get("quality") or {}).get("confidence", 0.5))
+        weight = max(0.15, min(1.0, confidence))
+        weighted_sum += float(score) * weight
+        total_weight += weight
+    return int(round(weighted_sum / total_weight)) if total_weight > 0 else 0
 
 def handler(job):
     import traceback
@@ -782,25 +825,12 @@ def handler(job):
                     overall_score = 0
                     overall_texture = 0
                 else:
-                    redness_vals = [
-                        s for s in [
-                            processed_angles.get("frontal",   {}).get("redness_score"),
-                            processed_angles.get("left_45",   {}).get("redness_score"),
-                            processed_angles.get("right_45",  {}).get("redness_score"),
-                        ] if isinstance(s, (int, float))
-                    ]
-                    overall_score = int(sum(redness_vals) / len(redness_vals)) if redness_vals else 0
-                    print(f"[handler] overall_redness_score={overall_score} (frontal+45°)")
+                    score_angles = ["frontal", "left_45", "right_45"]
+                    overall_score = weighted_angle_score(processed_angles, score_angles, "redness_score")
+                    print(f"[handler] overall_redness_score={overall_score} (weighted frontal+45°)")
 
-                    texture_vals = [
-                        s for s in [
-                            processed_angles.get("frontal",   {}).get("texture_score"),
-                            processed_angles.get("left_45",   {}).get("texture_score"),
-                            processed_angles.get("right_45",  {}).get("texture_score"),
-                        ] if isinstance(s, (int, float))
-                    ]
-                    overall_texture = int(sum(texture_vals) / len(texture_vals)) if texture_vals else 0
-                    print(f"[handler] overall_texture_score={overall_texture} (frontal+45°)")
+                    overall_texture = weighted_angle_score(processed_angles, score_angles, "texture_score")
+                    print(f"[handler] overall_texture_score={overall_texture} (weighted frontal+45°)")
 
                 update_supabase_scan(scan_id, processed_angles, frontal, overall_score, overall_texture)
                 print(f"[handler] DB updated OK for scan_id={scan_id}")
