@@ -44,8 +44,8 @@ TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "2048"))
 UPSCALE_FACTOR = float(os.environ.get("UPSCALE_FACTOR", "2.0"))
 UPSCALE_TRIGGER_PX = int(os.environ.get("UPSCALE_TRIGGER_PX", "1024"))
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
-BLUR_MIN_SCORE = float(os.environ.get("BLUR_MIN_SCORE", "50"))
-QUALITY_MIN_CONFIDENCE = float(os.environ.get("QUALITY_MIN_CONFIDENCE", "0.35"))
+BLUR_MIN_SCORE = float(os.environ.get("BLUR_MIN_SCORE", "42"))
+QUALITY_MIN_CONFIDENCE = float(os.environ.get("QUALITY_MIN_CONFIDENCE", "0.28"))
 
 
 def active_ort_providers() -> list:
@@ -236,6 +236,53 @@ def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Im
     result.putalpha(Image.fromarray(alpha_refined))
     return result
 
+def normalize_shadows(img: Image.Image) -> Image.Image:
+    """Lightweight shadow-lift while preserving overall contrast."""
+    rgb = np.array(img.convert("RGB"))
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.9, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    # Lift dark pixels a bit without flattening highlights.
+    dark = l2 < 95
+    l2 = l2.astype(np.float32)
+    l2[dark] = np.clip(l2[dark] * 1.12 + 7.0, 0, 255)
+    merged = cv2.merge([l2.astype(np.uint8), a, b])
+    out = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(out, mode="RGB")
+
+def _stable_skin_roi(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
+    """
+    Stable face ROI for scoring:
+    - keep inner face skin
+    - exclude hairline, eyes, lips, nostrils center strip
+    """
+    h, w = alpha_arr.shape
+    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
+    erode_px = max(10, int(min(h, w) * 0.045))
+    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
+    base = eroded > 105
+
+    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
+                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
+                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
+    base &= (brightness > 0.16) & (brightness < 0.96)
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    xn = xx / max(1.0, float(w - 1))
+    yn = yy / max(1.0, float(h - 1))
+
+    # Generic exclusion zones in normalized face crop coordinates.
+    hairline = yn < 0.18
+    left_eye = ((xn - 0.33) ** 2 / (0.11 ** 2) + (yn - 0.37) ** 2 / (0.07 ** 2)) < 1.0
+    right_eye = ((xn - 0.67) ** 2 / (0.11 ** 2) + (yn - 0.37) ** 2 / (0.07 ** 2)) < 1.0
+    lips = ((xn - 0.50) ** 2 / (0.17 ** 2) + (yn - 0.70) ** 2 / (0.08 ** 2)) < 1.0
+    nostrils = ((xn - 0.50) ** 2 / (0.08 ** 2) + (yn - 0.56) ** 2 / (0.05 ** 2)) < 1.0
+    unstable = hairline | left_eye | right_eye | lips | nostrils
+
+    roi = base & (~unstable)
+    return roi
+
 def on_black(clean_rgba: Image.Image) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
     alpha = clean_rgba.split()[3]
@@ -301,14 +348,7 @@ def compute_redness_score(clean_rgba: Image.Image) -> int:
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
-                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
-                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
-
-    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
-    erode_px = max(15, int(min(h, w) * 0.04))
-    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
-    skin_mask = (eroded > 100) & (brightness > 0.18)
+    skin_mask = _stable_skin_roi(alpha_arr, rgb_arr)
 
     if not np.any(skin_mask):
         return 0
@@ -336,15 +376,7 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
     alpha_arr = np.array(small)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
-    erode_px = max(8, int(min(h, w) * 0.04))
-    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
-    inner_face = eroded > 100
-
-    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
-                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
-                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
-    skin_mask = inner_face & (brightness > 0.18)
+    skin_mask = _stable_skin_roi(alpha_arr, rgb_arr)
 
     if not np.any(skin_mask):
         return 0
@@ -376,7 +408,7 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 REQUIRED_ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-ALIGNMENT_MAX_DELTA = float(os.environ.get("ALIGNMENT_MAX_DELTA", "0.10"))
+ALIGNMENT_MAX_DELTA = float(os.environ.get("ALIGNMENT_MAX_DELTA", "0.14"))
 
 
 def _supabase_headers() -> dict:
@@ -633,10 +665,22 @@ def _align_to_baseline(
     dy_px = dy_norm * h
 
     scale_delta = abs(scale - 1.0)
-    if scale_delta > ALIGNMENT_MAX_DELTA or abs(dx_norm) > ALIGNMENT_MAX_DELTA or abs(dy_norm) > ALIGNMENT_MAX_DELTA:
-        raise RuntimeError(
-            f"{angle_label}: alignment exceeds +/-{int(ALIGNMENT_MAX_DELTA * 100)}% "
-            f"(scale={scale:.3f}, dx={dx_norm:.3f}, dy={dy_norm:.3f}). Retake required."
+    clamped = False
+    if scale_delta > ALIGNMENT_MAX_DELTA:
+        scale = 1.0 + (ALIGNMENT_MAX_DELTA if scale > 1.0 else -ALIGNMENT_MAX_DELTA)
+        clamped = True
+    if abs(dx_norm) > ALIGNMENT_MAX_DELTA:
+        dx_norm = ALIGNMENT_MAX_DELTA if dx_norm > 0 else -ALIGNMENT_MAX_DELTA
+        dx_px = dx_norm * w
+        clamped = True
+    if abs(dy_norm) > ALIGNMENT_MAX_DELTA:
+        dy_norm = ALIGNMENT_MAX_DELTA if dy_norm > 0 else -ALIGNMENT_MAX_DELTA
+        dy_px = dy_norm * h
+        clamped = True
+    if clamped:
+        print(
+            f"[align] {angle_label}: transform clamped to +/-{int(ALIGNMENT_MAX_DELTA * 100)}% "
+            f"(scale={scale:.3f}, dx={dx_norm:.3f}, dy={dy_norm:.3f})"
         )
 
     aligned = _apply_alignment(clean_rgba, scale, dx_px, dy_px)
@@ -646,6 +690,7 @@ def _align_to_baseline(
         "dx": round(dx_norm, 5),
         "dy": round(dy_norm, 5),
         "max_delta": ALIGNMENT_MAX_DELTA,
+        "clamped": clamped,
     }
     return aligned, info
 
@@ -718,12 +763,16 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str, dict]:
     centre = rgb[cy - crop_size//2:cy + crop_size//2, cx - crop_size//2:cx + crop_size//2]
     gray = cv2.cvtColor(centre, cv2.COLOR_RGB2GRAY)
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    shadow_ratio = float(np.mean(gray < 42))
+    exposure = float(np.mean(gray) / 255.0)
     print(f"[quality_gate] blur_score={blur_score:.1f}")
-    if blur_score < BLUR_MIN_SCORE:
+    if blur_score < BLUR_MIN_SCORE * 0.78:
         return False, f"Image too blurry (score={blur_score:.0f}, min={BLUR_MIN_SCORE:.0f})", {
             "blur_score": float(blur_score),
             "face_score": 0.0,
             "confidence": 0.0,
+            "shadow_ratio": shadow_ratio,
+            "exposure": exposure,
         }
 
     # Face presence check
@@ -738,16 +787,23 @@ def check_image_quality(img: Image.Image) -> tuple[bool, str, dict]:
             "blur_score": float(blur_score),
             "face_score": 0.0,
             "confidence": 0.0,
+            "shadow_ratio": shadow_ratio,
+            "exposure": exposure,
         }
 
     face_score = float(results.detections[0].score[0]) if results.detections[0].score else 0.0
-    blur_norm = float(np.clip((blur_score - BLUR_MIN_SCORE) / 110.0, 0.0, 1.0))
+    blur_norm = float(np.clip((blur_score - BLUR_MIN_SCORE * 0.8) / 125.0, 0.0, 1.0))
     face_norm = float(np.clip((face_score - 0.35) / 0.65, 0.0, 1.0))
-    confidence = float(np.clip(0.65 * blur_norm + 0.35 * face_norm, 0.0, 1.0))
+    shadow_penalty = float(np.clip((shadow_ratio - 0.12) / 0.55, 0.0, 1.0))
+    exposure_penalty = float(np.clip(abs(exposure - 0.48) / 0.35, 0.0, 1.0))
+    confidence = float(np.clip(0.58 * blur_norm + 0.30 * face_norm + 0.12 * (1.0 - shadow_penalty), 0.0, 1.0))
+    confidence *= (1.0 - 0.25 * exposure_penalty)
     metrics = {
         "blur_score": float(blur_score),
         "face_score": face_score,
         "confidence": confidence,
+        "shadow_ratio": shadow_ratio,
+        "exposure": exposure,
     }
     print(f"[quality_gate] OK — blur={blur_score:.0f}, face={face_score:.2f}, confidence={confidence:.2f}")
     return True, "ok", metrics
@@ -770,6 +826,8 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
 
     original  = crop_to_face(original)
     print(f"[process_single] After face crop: {original.size}")
+    # Light shadow normalization keeps scoring consistent without requiring perfect capture lighting.
+    original = normalize_shadows(original)
     clean_rgba = remove_background(original)
     print("[process_single] Background removed")
     # Guided filter: snaps soft matting edges to actual image boundaries
@@ -829,6 +887,26 @@ def weighted_angle_score(processed_angles: dict, angle_keys: list[str], score_ke
         weighted_sum += float(score) * weight
         total_weight += weight
     return int(round(weighted_sum / total_weight)) if total_weight > 0 else 0
+
+def stable_angle_score(processed_angles: dict, angle_keys: list[str], score_key: str) -> int:
+    """
+    Use the most stable angle (highest confidence) as the primary overall score.
+    Falls back to confidence-weighted blend if no stable candidate exists.
+    """
+    best_score = None
+    best_conf = -1.0
+    for angle in angle_keys:
+        angle_result = processed_angles.get(angle, {})
+        score = angle_result.get(score_key)
+        if not isinstance(score, (int, float)):
+            continue
+        confidence = float((angle_result.get("quality") or {}).get("confidence", 0.0))
+        if confidence > best_conf:
+            best_conf = confidence
+            best_score = int(round(float(score)))
+    if best_score is not None:
+        return best_score
+    return weighted_angle_score(processed_angles, angle_keys, score_key)
 
 def handler(job):
     import traceback
@@ -904,11 +982,11 @@ def handler(job):
                     overall_texture = 0
                 else:
                     score_angles = ["frontal", "left_45", "right_45"]
-                    overall_score = weighted_angle_score(processed_angles, score_angles, "redness_score")
-                    print(f"[handler] overall_redness_score={overall_score} (weighted frontal+45°)")
+                    overall_score = stable_angle_score(processed_angles, score_angles, "redness_score")
+                    print(f"[handler] overall_redness_score={overall_score} (stable best-angle frontal+45°)")
 
-                    overall_texture = weighted_angle_score(processed_angles, score_angles, "texture_score")
-                    print(f"[handler] overall_texture_score={overall_texture} (weighted frontal+45°)")
+                    overall_texture = stable_angle_score(processed_angles, score_angles, "texture_score")
+                    print(f"[handler] overall_texture_score={overall_texture} (stable best-angle frontal+45°)")
 
                 if mode == "texture":
                     scan_context = _fetch_scan_context(scan_id)
