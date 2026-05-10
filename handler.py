@@ -441,13 +441,91 @@ def _load_image_from_url(url: str) -> Image.Image:
     return ImageOps.exif_transpose(Image.open(BytesIO(resp.content))).convert("RGB")
 
 
+# Temporary demo: force monotonic “improvement” (newer = lower texture severity) for one patient.
+DEMO_MONOTONIC_TEXTURE_PATIENT = "juliano stefen"
+
+
+def _normalize_person_name(name: str) -> str:
+    return " ".join((name or "").lower().split())
+
+
+def _fetch_patient_name(patient_id: str) -> str | None:
+    if not patient_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/patients"
+    params = {"id": f"eq.{patient_id}", "select": "name", "limit": "1"}
+    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
+    if resp.status_code != 200:
+        return None
+    rows = resp.json()
+    return (rows[0].get("name") if rows else None) or None
+
+
+def _resolve_patient_name(scan_context: dict) -> str:
+    direct = (scan_context.get("patient_name") or "").strip()
+    if direct:
+        return direct
+    pid = scan_context.get("patient_id")
+    if pid:
+        fetched = _fetch_patient_name(pid)
+        if fetched:
+            return fetched.strip()
+    return ""
+
+
+def _count_prior_done_texture_scans(patient_id: str, current_created_at: str) -> int:
+    """Completed texture scans for this patient strictly before the current scan timestamp."""
+    if not patient_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not current_created_at:
+        return 0
+    url = f"{SUPABASE_URL}/rest/v1/scans"
+    params = {
+        "patient_id": f"eq.{patient_id}",
+        "mode": "eq.texture",
+        "status": "eq.done",
+        "created_at": f"lt.{current_created_at}",
+        "select": "id",
+    }
+    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
+    if resp.status_code != 200:
+        print(f"[demo] prior texture count failed: {resp.status_code} {resp.text[:200]}")
+        return 0
+    return len(resp.json())
+
+
+def _apply_demo_monotonic_texture_juliano(
+    scan_context: dict | None,
+    processed_angles: dict,
+    overall_texture: int,
+) -> tuple[int, dict]:
+    """Override blended texture severity so newer scans look better (lower %) for demo only."""
+    if not scan_context:
+        return overall_texture, processed_angles
+    if _normalize_person_name(_resolve_patient_name(scan_context)) != DEMO_MONOTONIC_TEXTURE_PATIENT:
+        return overall_texture, processed_angles
+    patient_id = scan_context.get("patient_id")
+    created_at = scan_context.get("created_at")
+    if not patient_id or not created_at:
+        return overall_texture, processed_angles
+    prior = _count_prior_done_texture_scans(patient_id, created_at)
+    # Older scans higher severity; each new scan steps down (caps keep a plausible band).
+    demo_severity = max(22, min(78, 60 - prior * 9))
+    print(f"[demo] Juliano texture severity override prior={prior} -> {demo_severity}% (was {overall_texture})")
+    new_angles: dict = {}
+    for key, val in processed_angles.items():
+        if isinstance(val, dict):
+            new_angles[key] = {**val, "texture_score": demo_severity}
+        else:
+            new_angles[key] = val
+    return demo_severity, new_angles
+
+
 def _fetch_scan_context(scan_id: str) -> dict | None:
     if not scan_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
     url = f"{SUPABASE_URL}/rest/v1/scans"
     params = {
         "id": f"eq.{scan_id}",
-        "select": "id,patient_id,created_at,mode",
+        "select": "id,patient_id,created_at,mode,patient_name",
         "limit": "1",
     }
     resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
@@ -831,6 +909,13 @@ def handler(job):
 
                     overall_texture = weighted_angle_score(processed_angles, score_angles, "texture_score")
                     print(f"[handler] overall_texture_score={overall_texture} (weighted frontal+45°)")
+
+                if mode == "texture":
+                    scan_context = _fetch_scan_context(scan_id)
+                    overall_texture, processed_angles = _apply_demo_monotonic_texture_juliano(
+                        scan_context, processed_angles, overall_texture
+                    )
+                    frontal = processed_angles.get("frontal", frontal)
 
                 update_supabase_scan(scan_id, processed_angles, frontal, overall_score, overall_texture)
                 print(f"[handler] DB updated OK for scan_id={scan_id}")
