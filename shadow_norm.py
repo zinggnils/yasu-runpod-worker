@@ -11,11 +11,13 @@ from PIL import Image
 
 @dataclass(frozen=True)
 class ShadowNormParams:
-    clahe_clip_limit: float = 1.9
+    """Defaults tuned on ~/IMG_3897.png (bad side-shadow reference); override via SHADOW_* env."""
+
+    clahe_clip_limit: float = 2.4
     clahe_tile_grid: int = 8
-    dark_threshold: int = 95
-    dark_mult: float = 1.12
-    dark_lift: float = 7.0
+    dark_threshold: int = 102
+    dark_mult: float = 1.16
+    dark_lift: float = 10.0
 
     def label(self) -> str:
         return (
@@ -27,12 +29,13 @@ class ShadowNormParams:
 
 
 def load_shadow_params_from_env() -> ShadowNormParams:
+    defaults = ShadowNormParams()
     return ShadowNormParams(
-        clahe_clip_limit=float(os.environ.get("SHADOW_CLAHE_CLIP", "1.9")),
-        clahe_tile_grid=int(os.environ.get("SHADOW_CLAHE_TILE", "8")),
-        dark_threshold=int(os.environ.get("SHADOW_DARK_THRESHOLD", "95")),
-        dark_mult=float(os.environ.get("SHADOW_DARK_MULT", "1.12")),
-        dark_lift=float(os.environ.get("SHADOW_DARK_LIFT", "7.0")),
+        clahe_clip_limit=float(os.environ.get("SHADOW_CLAHE_CLIP", str(defaults.clahe_clip_limit))),
+        clahe_tile_grid=int(os.environ.get("SHADOW_CLAHE_TILE", str(defaults.clahe_tile_grid))),
+        dark_threshold=int(os.environ.get("SHADOW_DARK_THRESHOLD", str(defaults.dark_threshold))),
+        dark_mult=float(os.environ.get("SHADOW_DARK_MULT", str(defaults.dark_mult))),
+        dark_lift=float(os.environ.get("SHADOW_DARK_LIFT", str(defaults.dark_lift))),
     )
 
 

@@ -7,8 +7,8 @@ reports raw vs post-norm metrics so you can tune CLAHE/lift without letting bad
 frames "sneak through" if gates were ever moved post-norm.
 
 Usage:
-  python scripts/shadow_ab_matrix.py /path/to/images [--out report.csv]
-  SHADOW_PRESET=C_balanced python scripts/shadow_ab_matrix.py ./fixtures
+  python scripts/shadow_ab_matrix.py /path/to/image_or_folder [--out report.csv]
+  python scripts/shadow_ab_matrix.py ~/IMG_3897.png --pick-best
 """
 from __future__ import annotations
 
@@ -81,7 +81,11 @@ def row_for(path: Path, preset_name: str, params: ShadowNormParams) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Shadow normalization A/B matrix")
-    parser.add_argument("image_dir", type=Path, help="Folder of real captures (recursive)")
+    parser.add_argument(
+        "image_dir",
+        type=Path,
+        help="Image file or folder of captures (recursive for folders)",
+    )
     parser.add_argument("--out", type=Path, default=None, help="CSV output path (default: stdout)")
     parser.add_argument(
         "--quiet",
@@ -94,10 +98,22 @@ def main():
         default=list(SHADOW_AB_PRESETS.keys()),
         help=f"Preset keys (default: all). Available: {', '.join(SHADOW_AB_PRESETS)}",
     )
+    parser.add_argument(
+        "--pick-best",
+        action="store_true",
+        help="Print recommended preset + SHADOW_* env lines (uses max shadow_delta among raw_ok rows)",
+    )
     args = parser.parse_args()
 
-    if not args.image_dir.is_dir():
-        raise SystemExit(f"Not a directory: {args.image_dir}")
+    input_path = args.image_dir.expanduser().resolve()
+    if input_path.is_file():
+        if input_path.suffix.lower() not in IMAGE_EXTS:
+            raise SystemExit(f"Unsupported image type: {input_path}")
+        paths = [input_path]
+    elif input_path.is_dir():
+        paths = list(iter_images(input_path))
+    else:
+        raise SystemExit(f"Not found: {input_path}")
 
     presets = []
     for key in args.presets:
@@ -105,9 +121,8 @@ def main():
             raise SystemExit(f"Unknown preset {key!r}. Choose from: {list(SHADOW_AB_PRESETS)}")
         presets.append((key, SHADOW_AB_PRESETS[key]))
 
-    paths = list(iter_images(args.image_dir))
     if not paths:
-        raise SystemExit(f"No images under {args.image_dir}")
+        raise SystemExit(f"No images under {input_path}")
 
     rows: list[dict] = []
     for path in paths:
@@ -132,6 +147,29 @@ def main():
         elif rows:
             passed = sum(1 for r in rows if r["raw_ok"] and r["preset"] == presets[0][0])
             print(f"# raw_ok (baseline preset): {passed}/{len(paths)} images", file=sys.stderr)
+
+    if args.pick_best:
+        candidates = [r for r in rows if r["raw_ok"] and not r["rescued_bad_frame"]]
+        mode = "raw_ok"
+        if not candidates:
+            # Shadow-only tuning (e.g. reference stills where MP misses face).
+            candidates = [r for r in rows if not r["rescued_bad_frame"]]
+            mode = "shadow_delta"
+        if not candidates:
+            print("# No eligible rows — cannot pick preset.", file=sys.stderr)
+        else:
+            best = max(candidates, key=lambda r: float(r["shadow_delta"]))
+            p = SHADOW_AB_PRESETS[best["preset"]]
+            print(
+                f"# recommended_preset={best['preset']} mode={mode} "
+                f"shadow_delta={best['shadow_delta']} raw_ok={best['raw_ok']}",
+                file=sys.stderr,
+            )
+            print(f"export SHADOW_CLAHE_CLIP={p.clahe_clip_limit}", file=sys.stderr)
+            print(f"export SHADOW_CLAHE_TILE={p.clahe_tile_grid}", file=sys.stderr)
+            print(f"export SHADOW_DARK_THRESHOLD={p.dark_threshold}", file=sys.stderr)
+            print(f"export SHADOW_DARK_MULT={p.dark_mult}", file=sys.stderr)
+            print(f"export SHADOW_DARK_LIFT={p.dark_lift}", file=sys.stderr)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
