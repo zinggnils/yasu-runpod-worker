@@ -12,13 +12,22 @@ import numpy as np
 import cv2
 import onnxruntime as ort
 from rembg import new_session, remove
+from image_quality import (
+    BLUR_MIN_SCORE,
+    MEDIAPIPE_AVAILABLE,
+    QUALITY_MIN_CONFIDENCE,
+    check_image_quality,
+)
+from shadow_norm import load_shadow_params_from_env, normalize_shadows
+
 try:
     import mediapipe as mp
-    MEDIAPIPE_AVAILABLE = True
-    print(f"[startup] mediapipe version={mp.__version__}")
+
+    if MEDIAPIPE_AVAILABLE:
+        print(f"[startup] mediapipe version={mp.__version__}")
+    else:
+        print("[startup] mediapipe unavailable")
 except Exception as e:
-    mp = None
-    MEDIAPIPE_AVAILABLE = False
     print(f"[startup] mediapipe unavailable: {e}")
 
 print(f"ORT version: {ort.__version__}")  # build trigger
@@ -44,8 +53,6 @@ TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "2048"))
 UPSCALE_FACTOR = float(os.environ.get("UPSCALE_FACTOR", "2.0"))
 UPSCALE_TRIGGER_PX = int(os.environ.get("UPSCALE_TRIGGER_PX", "1024"))
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
-BLUR_MIN_SCORE = float(os.environ.get("BLUR_MIN_SCORE", "42"))
-QUALITY_MIN_CONFIDENCE = float(os.environ.get("QUALITY_MIN_CONFIDENCE", "0.28"))
 
 
 def active_ort_providers() -> list:
@@ -235,21 +242,6 @@ def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Im
     result = clean_rgba.copy()
     result.putalpha(Image.fromarray(alpha_refined))
     return result
-
-def normalize_shadows(img: Image.Image) -> Image.Image:
-    """Lightweight shadow-lift while preserving overall contrast."""
-    rgb = np.array(img.convert("RGB"))
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=1.9, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    # Lift dark pixels a bit without flattening highlights.
-    dark = l2 < 95
-    l2 = l2.astype(np.float32)
-    l2[dark] = np.clip(l2[dark] * 1.12 + 7.0, 0, 255)
-    merged = cv2.merge([l2.astype(np.uint8), a, b])
-    out = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
-    return Image.fromarray(out, mode="RGB")
 
 def _stable_skin_roi(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
     """
@@ -749,66 +741,6 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     return crop.resize((out_px, out_px), Image.LANCZOS)
 
 
-def check_image_quality(img: Image.Image) -> tuple[bool, str, dict]:
-    """Returns (ok, reason, metrics). Rejects blurry images and images with no face."""
-    if not MEDIAPIPE_AVAILABLE or mp is None:
-        raise RuntimeError("mediapipe is required for quality checks but is not available")
-
-    rgb = np.array(img.convert("RGB"))
-    h, w = rgb.shape[:2]
-
-    # Blur check: Laplacian variance on centre crop
-    cx, cy = w // 2, h // 2
-    crop_size = min(w, h) // 2
-    centre = rgb[cy - crop_size//2:cy + crop_size//2, cx - crop_size//2:cx + crop_size//2]
-    gray = cv2.cvtColor(centre, cv2.COLOR_RGB2GRAY)
-    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    shadow_ratio = float(np.mean(gray < 42))
-    exposure = float(np.mean(gray) / 255.0)
-    print(f"[quality_gate] blur_score={blur_score:.1f}")
-    if blur_score < BLUR_MIN_SCORE * 0.78:
-        return False, f"Image too blurry (score={blur_score:.0f}, min={BLUR_MIN_SCORE:.0f})", {
-            "blur_score": float(blur_score),
-            "face_score": 0.0,
-            "confidence": 0.0,
-            "shadow_ratio": shadow_ratio,
-            "exposure": exposure,
-        }
-
-    # Face presence check
-    with mp.solutions.face_detection.FaceDetection(
-        model_selection=1,
-        min_detection_confidence=0.35,
-    ) as detector:
-        results = detector.process(rgb)
-
-    if not results.detections:
-        return False, "No face detected in image", {
-            "blur_score": float(blur_score),
-            "face_score": 0.0,
-            "confidence": 0.0,
-            "shadow_ratio": shadow_ratio,
-            "exposure": exposure,
-        }
-
-    face_score = float(results.detections[0].score[0]) if results.detections[0].score else 0.0
-    blur_norm = float(np.clip((blur_score - BLUR_MIN_SCORE * 0.8) / 125.0, 0.0, 1.0))
-    face_norm = float(np.clip((face_score - 0.35) / 0.65, 0.0, 1.0))
-    shadow_penalty = float(np.clip((shadow_ratio - 0.12) / 0.55, 0.0, 1.0))
-    exposure_penalty = float(np.clip(abs(exposure - 0.48) / 0.35, 0.0, 1.0))
-    confidence = float(np.clip(0.58 * blur_norm + 0.30 * face_norm + 0.12 * (1.0 - shadow_penalty), 0.0, 1.0))
-    confidence *= (1.0 - 0.25 * exposure_penalty)
-    metrics = {
-        "blur_score": float(blur_score),
-        "face_score": face_score,
-        "confidence": confidence,
-        "shadow_ratio": shadow_ratio,
-        "exposure": exposure,
-    }
-    print(f"[quality_gate] OK — blur={blur_score:.0f}, face={face_score:.2f}, confidence={confidence:.2f}")
-    return True, "ok", metrics
-
-
 def process_single(image_b64: str, label: str, mode: str = "redness", baseline_metrics: dict | None = None) -> dict:
     img_data  = base64.b64decode(image_b64)
     original  = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
@@ -827,7 +759,9 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
     original  = crop_to_face(original)
     print(f"[process_single] After face crop: {original.size}")
     # Light shadow normalization keeps scoring consistent without requiring perfect capture lighting.
-    original = normalize_shadows(original)
+    shadow_params = load_shadow_params_from_env()
+    print(f"[process_single] shadow_norm {shadow_params.label()}")
+    original = normalize_shadows(original, shadow_params)
     clean_rgba = remove_background(original)
     print("[process_single] Background removed")
     # Guided filter: snaps soft matting edges to actual image boundaries
