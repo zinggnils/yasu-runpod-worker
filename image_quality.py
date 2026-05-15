@@ -69,18 +69,45 @@ def gate_decision(metrics: dict, face_score: float) -> tuple[bool, str, float]:
     return True, "ok", confidence
 
 
-def detect_face_score(rgb: np.ndarray) -> float:
+def detect_face_detection(rgb: np.ndarray):
+    """Largest face detection or None."""
     if not MEDIAPIPE_AVAILABLE or mp is None:
         raise RuntimeError("mediapipe is required for quality checks but is not available")
+    h, w = rgb.shape[:2]
     with mp.solutions.face_detection.FaceDetection(
         model_selection=1,
         min_detection_confidence=0.35,
     ) as detector:
         results = detector.process(rgb)
     if not results.detections:
-        return 0.0
-    det = results.detections[0]
-    return float(det.score[0]) if det.score else 0.0
+        return None
+    best = results.detections[0]
+    best_area = 0.0
+    for det in results.detections:
+        bb = det.location_data.relative_bounding_box
+        area = float(bb.width) * float(bb.height)
+        if area > best_area:
+            best_area = area
+            best = det
+    bb = best.location_data.relative_bounding_box
+    xmin = float(bb.xmin)
+    ymin = float(bb.ymin)
+    bw = float(bb.width)
+    bh = float(bb.height)
+    return {
+        "face_score": float(best.score[0]) if best.score else 0.0,
+        "face_width_norm": bw,
+        "face_height_norm": bh,
+        "face_center_x_norm": xmin + bw / 2.0,
+        "face_center_y_norm": ymin + bh / 2.0,
+        "image_width": w,
+        "image_height": h,
+    }
+
+
+def detect_face_score(rgb: np.ndarray) -> float:
+    det = detect_face_detection(rgb)
+    return float(det["face_score"]) if det else 0.0
 
 
 def check_image_quality(img: Image.Image, *, quiet: bool = False) -> tuple[bool, str, dict]:
@@ -101,12 +128,21 @@ def check_image_quality(img: Image.Image, *, quiet: bool = False) -> tuple[bool,
             "confidence": 0.0,
         }
 
-    face_score = detect_face_score(rgb)
-    if face_score <= 0.0:
+    det = detect_face_detection(rgb)
+    if not det or det["face_score"] <= 0.0:
         return False, "No face detected in image", {**metrics, "face_score": 0.0, "confidence": 0.0}
 
+    face_score = float(det["face_score"])
     confidence = confidence_from_metrics(metrics, face_score)
-    out = {**metrics, "face_score": face_score, "confidence": confidence}
+    out = {
+        **metrics,
+        "face_score": face_score,
+        "confidence": confidence,
+        "face_width_norm": det["face_width_norm"],
+        "face_height_norm": det["face_height_norm"],
+        "face_center_x_norm": det["face_center_x_norm"],
+        "face_center_y_norm": det["face_center_y_norm"],
+    }
     ok, reason, _ = gate_decision(metrics, face_score)
     if not ok:
         return False, reason, out

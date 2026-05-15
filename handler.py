@@ -18,6 +18,7 @@ from image_quality import (
     QUALITY_MIN_CONFIDENCE,
     check_image_quality,
 )
+from capture_targets import FRONTAL_RETAKE_CONFIDENCE, repositioning_hint
 from shadow_norm import load_shadow_params_from_env, normalize_shadows
 
 try:
@@ -747,6 +748,12 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
     print(f"[process_single] Input size: {original.size}")
 
     ok, reason, quality_metrics = check_image_quality(original)
+    fw = quality_metrics.get("face_width_norm")
+    fx = quality_metrics.get("face_center_x_norm")
+    if isinstance(fw, (int, float)) and isinstance(fx, (int, float)):
+        hint = repositioning_hint(label, mode, float(fw), float(fx))
+        if hint:
+            quality_metrics["repositioning_hint"] = hint
     print(f"[process_single] Quality gate {'OK' if ok else 'WARN: ' + reason} for {label}")
     if not ok:
         raise RuntimeError(f"{label}: {reason}")
