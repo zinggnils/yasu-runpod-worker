@@ -72,7 +72,7 @@ def gate_decision(metrics: dict, face_score: float) -> tuple[bool, str, float]:
 def detect_face_detection(rgb: np.ndarray):
     """Largest face detection or None."""
     if not MEDIAPIPE_AVAILABLE or mp is None:
-        raise RuntimeError("mediapipe is required for quality checks but is not available")
+        return None
     h, w = rgb.shape[:2]
     with mp.solutions.face_detection.FaceDetection(
         model_selection=1,
@@ -111,10 +111,7 @@ def detect_face_score(rgb: np.ndarray) -> float:
 
 
 def check_image_quality(img: Image.Image, *, quiet: bool = False) -> tuple[bool, str, dict]:
-    """Returns (ok, reason, metrics). Rejects blurry images and images with no face."""
-    if not MEDIAPIPE_AVAILABLE or mp is None:
-        raise RuntimeError("mediapipe is required for quality checks but is not available")
-
+    """Returns (ok, reason, metrics). May 4 MVP: warn on issues but never block processing."""
     rgb = np.array(img.convert("RGB"))
     metrics = centre_gray_metrics(rgb)
     blur_score = metrics["blur_score"]
@@ -122,15 +119,23 @@ def check_image_quality(img: Image.Image, *, quiet: bool = False) -> tuple[bool,
         print(f"[quality_gate] blur_score={blur_score:.1f}")
 
     if blur_score < BLUR_MIN_SCORE * 0.78:
-        return False, f"Image too blurry (score={blur_score:.0f}, min={BLUR_MIN_SCORE:.0f})", {
+        if not quiet:
+            print(f"[quality_gate] WARN blurry score={blur_score:.0f} — processing anyway")
+        return True, f"warn: blurry ({blur_score:.0f})", {
             **metrics,
             "face_score": 0.0,
-            "confidence": 0.0,
+            "confidence": 0.35,
         }
 
     det = detect_face_detection(rgb)
     if not det or det["face_score"] <= 0.0:
-        return False, "No face detected in image", {**metrics, "face_score": 0.0, "confidence": 0.0}
+        if not quiet:
+            print("[quality_gate] WARN no face / mediapipe unavailable — processing anyway")
+        return True, "warn: no face detect", {
+            **metrics,
+            "face_score": 0.0,
+            "confidence": 0.4,
+        }
 
     face_score = float(det["face_score"])
     confidence = confidence_from_metrics(metrics, face_score)
@@ -145,7 +150,9 @@ def check_image_quality(img: Image.Image, *, quiet: bool = False) -> tuple[bool,
     }
     ok, reason, _ = gate_decision(metrics, face_score)
     if not ok:
-        return False, reason, out
+        if not quiet:
+            print(f"[quality_gate] WARN {reason} — processing anyway (May 4 MVP)")
+        return True, f"warn: {reason}", out
     if not quiet:
         print(
             f"[quality_gate] OK — blur={blur_score:.0f}, face={face_score:.2f}, confidence={confidence:.2f}"

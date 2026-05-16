@@ -687,11 +687,24 @@ def _align_to_baseline(
     }
     return aligned, info
 
+def _center_square_crop(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top = max(0, min((h - side) // 2 - int(h * 0.05), h - side))
+    crop = img.crop((left, top, left + side, top + side))
+    scale = UPSCALE_FACTOR if side < UPSCALE_TRIGGER_PX else 1.0
+    out_px = min(TARGET_MAX_PX, int(side * scale))
+    out_px = max(800, out_px)
+    return crop.resize((out_px, out_px), Image.LANCZOS)
+
+
 def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     """MediaPipe face detection crop — handles frontal and profile angles.
-    Falls back to center crop if no face detected."""
+    Falls back to center crop if no face detected or mediapipe unavailable."""
     if not MEDIAPIPE_AVAILABLE or mp is None:
-        raise RuntimeError("mediapipe is required for face crop but is not available")
+        print("[crop_to_face] mediapipe unavailable, center crop")
+        return _center_square_crop(img)
 
     rgb = np.array(img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -703,15 +716,8 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
         results = detector.process(rgb)
 
     if not results.detections:
-        side = min(w, h)
-        left = (w - side) // 2
-        top = max(0, min((h - side) // 2 - int(h * 0.05), h - side))
-        print(f"[crop_to_face] No face detected, center crop {side}×{side}")
-        crop = img.crop((left, top, left + side, top + side))
-        scale = UPSCALE_FACTOR if side < UPSCALE_TRIGGER_PX else 1.0
-        out_px = min(TARGET_MAX_PX, int(side * scale))
-        out_px = max(800, out_px)
-        return crop.resize((out_px, out_px), Image.LANCZOS)
+        print("[crop_to_face] No face detected, center crop")
+        return _center_square_crop(img)
 
     detection = results.detections[0]
     bb = detection.location_data.relative_bounding_box
@@ -908,10 +914,10 @@ def handler(job):
                 failed_angles.append(key)
         if failed_angles:
             failed_detail = ", ".join(failed_angles)
-            raise RuntimeError(
-                f"Required angle processing failed for: {failed_detail}. "
-                "Rejecting scan to prevent low-quality/partial results."
-            )
+            ok_count = len(REQUIRED_ANGLE_KEYS) - len(failed_angles)
+            if ok_count == 0:
+                raise RuntimeError(f"All angles failed: {failed_detail}")
+            print(f"[handler] WARN some angles failed ({failed_detail}) — {ok_count}/5 OK, continuing")
 
         if scan_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
             try:

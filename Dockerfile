@@ -17,4 +17,5 @@ RUN mkdir -p /root/.u2net /root/.modnet && \
     echo "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae  /root/.modnet/modnet_photographic.onnx" | sha256sum -c -
 
 COPY handler.py image_quality.py shadow_norm.py capture_targets.py ./
+RUN python -c "import image_quality, shadow_norm, capture_targets; import handler; print('worker modules OK')"
 CMD ["python", "-u", "handler.py"]
