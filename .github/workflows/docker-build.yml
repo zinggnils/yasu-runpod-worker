@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - "handler.py"
+      - "image_quality.py"
+      - "shadow_norm.py"
+      - "capture_targets.py"
       - "requirements.txt"
       - "Dockerfile"
 

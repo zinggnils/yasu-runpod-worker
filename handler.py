@@ -957,4 +957,5 @@ def handler(job):
     return {"error": "No images provided."}
 
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
