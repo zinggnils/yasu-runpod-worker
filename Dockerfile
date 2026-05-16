@@ -16,5 +16,5 @@ RUN mkdir -p /root/.u2net /root/.modnet && \
     curl -L https://github.com/yakhyo/modnet/releases/download/weights/modnet_photographic.onnx -o /root/.modnet/modnet_photographic.onnx && \
     echo "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae  /root/.modnet/modnet_photographic.onnx" | sha256sum -c -
 
-COPY handler.py .
+COPY handler.py image_quality.py shadow_norm.py capture_targets.py ./
 CMD ["python", "-u", "handler.py"]

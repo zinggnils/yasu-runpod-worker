@@ -755,12 +755,11 @@ def process_single(image_b64: str, label: str, mode: str = "redness", baseline_m
         if hint:
             quality_metrics["repositioning_hint"] = hint
     print(f"[process_single] Quality gate {'OK' if ok else 'WARN: ' + reason} for {label}")
-    if not ok:
-        raise RuntimeError(f"{label}: {reason}")
-    if quality_metrics.get("confidence", 0.0) < QUALITY_MIN_CONFIDENCE:
-        raise RuntimeError(
-            f"{label}: unstable capture confidence={quality_metrics.get('confidence', 0.0):.2f} "
-            f"(min={QUALITY_MIN_CONFIDENCE:.2f})"
+    conf = float(quality_metrics.get("confidence", 0.0) or 0.0)
+    if conf < QUALITY_MIN_CONFIDENCE:
+        print(
+            f"[process_single] WARN {label}: low confidence={conf:.2f} "
+            f"(min={QUALITY_MIN_CONFIDENCE:.2f}) — processing anyway (May 4 MVP)"
         )
 
     original  = crop_to_face(original)
