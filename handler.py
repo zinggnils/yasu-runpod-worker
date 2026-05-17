@@ -22,8 +22,11 @@ except Exception as e:
     MEDIAPIPE_AVAILABLE = False
     print(f"[startup] mediapipe unavailable: {e}")
 
-# May 4 golden scan (270526c8): 800px face crop, no shadow_norm / alignment.
+# May 4 golden scan (270526c8): full-frame EXIF-corrected image → MODNet → score.
+# Face crop / quality gate are opt-in via env (default off for stable scores).
 MVP_CROP_PX = 800
+ENABLE_FACE_CROP = os.environ.get("ENABLE_FACE_CROP", "false").lower() in ("1", "true", "yes")
+ENABLE_QUALITY_GATE = os.environ.get("ENABLE_QUALITY_GATE", "false").lower() in ("1", "true", "yes")
 
 print(f"ORT version: {ort.__version__}")  # build trigger
 print(f"Available providers: {ort.get_available_providers()}")
@@ -44,10 +47,34 @@ MODNET_MODEL_SHA256 = os.environ.get(
     "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae",
 ).strip().lower()
 MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
-TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "2048"))
+TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "1920"))
 UPSCALE_FACTOR = float(os.environ.get("UPSCALE_FACTOR", "2.0"))
 UPSCALE_TRIGGER_PX = int(os.environ.get("UPSCALE_TRIGGER_PX", "1024"))
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
+
+print(
+    f"[startup] pipeline face_crop={ENABLE_FACE_CROP} quality_gate={ENABLE_QUALITY_GATE} "
+    f"target_max_px={TARGET_MAX_PX}"
+)
+
+
+def normalize_input_size(img: Image.Image) -> Image.Image:
+    """Cap longest edge at TARGET_MAX_PX; optionally upscale small captures."""
+    w, h = img.size
+    longest = max(w, h)
+    if longest > TARGET_MAX_PX:
+        scale = TARGET_MAX_PX / longest
+    elif longest < UPSCALE_TRIGGER_PX:
+        scale = min(UPSCALE_FACTOR, TARGET_MAX_PX / max(longest, 1))
+    else:
+        return img
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    if (new_w, new_h) == (w, h):
+        return img
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    print(f"[process_single] Normalized size: {img.size} → {resized.size}")
+    return resized
 
 
 def active_ort_providers() -> list:
@@ -270,6 +297,27 @@ def _stable_skin_roi(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
     roi = base & (~unstable)
     return roi
 
+
+def _full_frame_skin_mask(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
+    """Skin mask for full-frame MODNet output (May 4 golden path scoring)."""
+    h, w = alpha_arr.shape
+    brightness = (
+        0.2126 * rgb_arr[..., 0].astype(np.float32)
+        + 0.7152 * rgb_arr[..., 1].astype(np.float32)
+        + 0.0722 * rgb_arr[..., 2].astype(np.float32)
+    ) / 255.0
+    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
+    erode_px = max(15, int(min(h, w) * 0.04))
+    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
+    return (eroded > 100) & (brightness > 0.18) & (brightness < 0.96)
+
+
+def _skin_mask_for_scoring(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
+    if ENABLE_FACE_CROP:
+        return _stable_skin_roi(alpha_arr, rgb_arr)
+    return _full_frame_skin_mask(alpha_arr, rgb_arr)
+
+
 def on_black(clean_rgba: Image.Image) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
     alpha = clean_rgba.split()[3]
@@ -335,7 +383,7 @@ def compute_redness_score(clean_rgba: Image.Image) -> int:
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    skin_mask = _stable_skin_roi(alpha_arr, rgb_arr)
+    skin_mask = _skin_mask_for_scoring(alpha_arr, rgb_arr)
 
     if not np.any(skin_mask):
         return 0
@@ -363,7 +411,7 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
     alpha_arr = np.array(small)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    skin_mask = _stable_skin_roi(alpha_arr, rgb_arr)
+    skin_mask = _skin_mask_for_scoring(alpha_arr, rgb_arr)
 
     if not np.any(skin_mask):
         return 0
@@ -770,18 +818,24 @@ def process_single(
     mode: str = "redness",
     baseline_metrics: dict | None = None,
 ) -> dict:
-    """May 4 golden path: EXIF → warn-only quality → 800px crop → MODNet → scores (no shadow/align)."""
+    """May 4 golden path (default): EXIF → normalize → MODNet on full frame → scores."""
     del baseline_metrics  # not used in MVP pipeline
     img_data = base64.b64decode(image_b64)
     original = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
+    original = normalize_input_size(original)
 
-    ok, reason = check_image_quality_mvp(original)
-    if not ok:
-        print(f"[process_single] Quality gate WARNING for {label}: {reason} — continuing anyway")
+    if ENABLE_QUALITY_GATE:
+        ok, reason = check_image_quality_mvp(original)
+        if not ok:
+            print(f"[process_single] Quality gate WARNING for {label}: {reason} — continuing anyway")
+    else:
+        print(f"[process_single] Quality gate skipped for {label}")
 
-    original = crop_to_face(original)
-    print(f"[process_single] After face crop: {original.size}")
+    if ENABLE_FACE_CROP:
+        original = crop_to_face(original)
+        print(f"[process_single] After face crop: {original.size}")
+
     clean_rgba = remove_background(original)
     print("[process_single] Background removed")
     clean_rgba = refine_alpha(original, clean_rgba)
