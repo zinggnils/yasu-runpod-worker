@@ -12,26 +12,6 @@ import numpy as np
 import cv2
 import onnxruntime as ort
 from rembg import new_session, remove
-try:
-    import mediapipe as mp
-
-    MEDIAPIPE_AVAILABLE = True
-    print(f"[startup] mediapipe version={mp.__version__}")
-except Exception as e:
-    mp = None
-    MEDIAPIPE_AVAILABLE = False
-    print(f"[startup] mediapipe unavailable: {e}")
-
-# May 4 golden scan (270526c8): full-frame EXIF-corrected image → MODNet → score.
-# Face crop / quality gate are opt-in via env (default off for stable scores).
-MVP_CROP_PX = 800
-ENABLE_FACE_CROP = os.environ.get("ENABLE_FACE_CROP", "false").lower() in ("1", "true", "yes")
-ENABLE_QUALITY_GATE = os.environ.get("ENABLE_QUALITY_GATE", "false").lower() in ("1", "true", "yes")
-ENABLE_INPUT_NORMALIZE = os.environ.get("ENABLE_INPUT_NORMALIZE", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
 
 print(f"ORT version: {ort.__version__}")  # build trigger
 print(f"Available providers: {ort.get_available_providers()}")
@@ -52,34 +32,6 @@ MODNET_MODEL_SHA256 = os.environ.get(
     "5069a5e306b9f5e9f4f2b0360264c9f8ea13b257c7c39943c7cf6a2ec3a102ae",
 ).strip().lower()
 MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
-TARGET_MAX_PX = int(os.environ.get("TARGET_MAX_PX", "1920"))
-UPSCALE_FACTOR = float(os.environ.get("UPSCALE_FACTOR", "2.0"))
-UPSCALE_TRIGGER_PX = int(os.environ.get("UPSCALE_TRIGGER_PX", "1024"))
-SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
-
-print(
-    f"[startup] pipeline face_crop={ENABLE_FACE_CROP} quality_gate={ENABLE_QUALITY_GATE} "
-    f"input_normalize={ENABLE_INPUT_NORMALIZE} target_max_px={TARGET_MAX_PX}"
-)
-
-
-def normalize_input_size(img: Image.Image) -> Image.Image:
-    """Cap longest edge at TARGET_MAX_PX; optionally upscale small captures."""
-    w, h = img.size
-    longest = max(w, h)
-    if longest > TARGET_MAX_PX:
-        scale = TARGET_MAX_PX / longest
-    elif longest < UPSCALE_TRIGGER_PX:
-        scale = min(UPSCALE_FACTOR, TARGET_MAX_PX / max(longest, 1))
-    else:
-        return img
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    if (new_w, new_h) == (w, h):
-        return img
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-    print(f"[process_single] Normalized size: {img.size} → {resized.size}")
-    return resized
 
 
 def active_ort_providers() -> list:
@@ -270,59 +222,6 @@ def refine_alpha(original_rgb: Image.Image, clean_rgba: Image.Image) -> Image.Im
     result.putalpha(Image.fromarray(alpha_refined))
     return result
 
-def _stable_skin_roi(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
-    """
-    Stable face ROI for scoring:
-    - keep inner face skin
-    - exclude hairline, eyes, lips, nostrils center strip
-    """
-    h, w = alpha_arr.shape
-    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
-    erode_px = max(10, int(min(h, w) * 0.045))
-    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
-    base = eroded > 105
-
-    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
-                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
-                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
-    base &= (brightness > 0.16) & (brightness < 0.96)
-
-    yy, xx = np.mgrid[0:h, 0:w]
-    xn = xx / max(1.0, float(w - 1))
-    yn = yy / max(1.0, float(h - 1))
-
-    # Generic exclusion zones in normalized face crop coordinates.
-    hairline = yn < 0.18
-    left_eye = ((xn - 0.33) ** 2 / (0.11 ** 2) + (yn - 0.37) ** 2 / (0.07 ** 2)) < 1.0
-    right_eye = ((xn - 0.67) ** 2 / (0.11 ** 2) + (yn - 0.37) ** 2 / (0.07 ** 2)) < 1.0
-    lips = ((xn - 0.50) ** 2 / (0.17 ** 2) + (yn - 0.70) ** 2 / (0.08 ** 2)) < 1.0
-    nostrils = ((xn - 0.50) ** 2 / (0.08 ** 2) + (yn - 0.56) ** 2 / (0.05 ** 2)) < 1.0
-    unstable = hairline | left_eye | right_eye | lips | nostrils
-
-    roi = base & (~unstable)
-    return roi
-
-
-def _full_frame_skin_mask(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
-    """Skin mask for full-frame MODNet output (May 4 golden path scoring)."""
-    h, w = alpha_arr.shape
-    brightness = (
-        0.2126 * rgb_arr[..., 0].astype(np.float32)
-        + 0.7152 * rgb_arr[..., 1].astype(np.float32)
-        + 0.0722 * rgb_arr[..., 2].astype(np.float32)
-    ) / 255.0
-    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
-    erode_px = max(15, int(min(h, w) * 0.04))
-    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
-    return (eroded > 100) & (brightness > 0.18) & (brightness < 0.96)
-
-
-def _skin_mask_for_scoring(alpha_arr: np.ndarray, rgb_arr: np.ndarray) -> np.ndarray:
-    if ENABLE_FACE_CROP:
-        return _stable_skin_roi(alpha_arr, rgb_arr)
-    return _full_frame_skin_mask(alpha_arr, rgb_arr)
-
-
 def on_black(clean_rgba: Image.Image) -> Image.Image:
     clean_rgba = clean_rgba.convert("RGBA")
     alpha = clean_rgba.split()[3]
@@ -333,14 +232,13 @@ def on_black(clean_rgba: Image.Image) -> Image.Image:
     # makes skin texture, pores and fine detail visually pop without over-sharpening edges.
     arr = np.array(rgb).astype(np.float32)
     blur_large = cv2.GaussianBlur(arr, (0, 0), sigmaX=30)
-    clarity_strength = 0.18 * SHARPEN_AMOUNT
-    arr_clarity = np.clip(arr + (arr - blur_large) * clarity_strength, 0, 255).astype(np.uint8)
+    # strength=0.45 ≈ Lightroom Clarity +40 / Adobe Express texture boost
+    arr_clarity = np.clip(arr + (arr - blur_large) * 0.45, 0, 255).astype(np.uint8)
     rgb = Image.fromarray(arr_clarity)
 
     # ── Step 2: Fine sharpening pass ──
     # Crispens edges and fine lines — radius=1.5, percent=220 ≈ Adobe Express Sharpen +25
-    unsharp_percent = max(100, int(100 * SHARPEN_AMOUNT))
-    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.3, percent=unsharp_percent, threshold=1))
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=220, threshold=1))
 
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(rgb, mask=alpha)
@@ -368,8 +266,7 @@ def make_visia_duotone(clean_rgba: Image.Image, invert: bool = False) -> Image.I
         bone = cv2.applyColorMap(contrast_clarity, cv2.COLORMAP_BONE)
         duotone = Image.fromarray(cv2.cvtColor(bone, cv2.COLOR_BGR2RGB), mode="RGB")
 
-    duotone_percent = max(100, int(100 * SHARPEN_AMOUNT))
-    duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.3, percent=duotone_percent, threshold=1))
+    duotone = duotone.filter(ImageFilter.UnsharpMask(radius=1.5, percent=200, threshold=1))
     result = Image.new("RGB", clean_rgba.size, (0, 0, 0))
     result.paste(duotone, mask=Image.fromarray(alpha_arr, mode="L"))
     return result
@@ -388,7 +285,14 @@ def compute_redness_score(clean_rgba: Image.Image) -> int:
     alpha_arr = np.array(clean_rgba)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    skin_mask = _skin_mask_for_scoring(alpha_arr, rgb_arr)
+    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
+                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
+                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
+
+    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
+    erode_px = max(15, int(min(h, w) * 0.04))
+    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
+    skin_mask = (eroded > 100) & (brightness > 0.18)
 
     if not np.any(skin_mask):
         return 0
@@ -416,7 +320,15 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
     alpha_arr = np.array(small)[..., 3].astype(np.float32) / 255.0
     h, w = alpha_arr.shape
 
-    skin_mask = _skin_mask_for_scoring(alpha_arr, rgb_arr)
+    alpha_uint8 = (alpha_arr * 255).astype(np.uint8)
+    erode_px = max(8, int(min(h, w) * 0.04))
+    eroded = cv2.erode(alpha_uint8, np.ones((erode_px, erode_px), np.uint8), iterations=1)
+    inner_face = eroded > 100
+
+    brightness = (0.2126 * rgb_arr[..., 0].astype(np.float32)
+                + 0.7152 * rgb_arr[..., 1].astype(np.float32)
+                + 0.0722 * rgb_arr[..., 2].astype(np.float32)) / 255.0
+    skin_mask = inner_face & (brightness > 0.18)
 
     if not np.any(skin_mask):
         return 0
@@ -447,308 +359,11 @@ def compute_texture_score(clean_rgba: Image.Image) -> int:
     return int(min(100, float(tm_face[tm_face >= max(p75, 0.01)].mean()) * 100))
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-REQUIRED_ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-ALIGNMENT_MAX_DELTA = float(os.environ.get("ALIGNMENT_MAX_DELTA", "0.14"))
-
-
-def _supabase_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Content-Type": "application/json",
-    }
-
-
-def _subject_metrics_for_alignment(img_rgb: Image.Image, clean_rgba: Image.Image) -> dict | None:
-    """Compute alignment metrics from face bbox + shoulder width."""
-    if not MEDIAPIPE_AVAILABLE or mp is None:
-        return None
-
-    rgb = np.array(img_rgb.convert("RGB"))
-    h, w = rgb.shape[:2]
-    if h <= 0 or w <= 0:
-        return None
-
-    with mp.solutions.face_detection.FaceDetection(
-        model_selection=1,
-        min_detection_confidence=0.35,
-    ) as detector:
-        results = detector.process(rgb)
-
-    if not results.detections:
-        return None
-
-    bb = results.detections[0].location_data.relative_bounding_box
-    face_cx = float(bb.xmin + bb.width * 0.5)
-    face_cy = float(bb.ymin + bb.height * 0.5)
-    face_w = float(bb.width)
-
-    alpha = np.array(clean_rgba.convert("RGBA").split()[3])
-    alpha_mask = alpha > 18
-    if not np.any(alpha_mask):
-        return None
-
-    # Shoulder estimate from lower torso band (robust for profile and frontal).
-    y1 = int(alpha.shape[0] * 0.64)
-    y2 = int(alpha.shape[0] * 0.86)
-    band = alpha_mask[y1:y2, :]
-    row_widths = np.sum(band, axis=1).astype(np.float32)
-    if row_widths.size == 0:
-        return None
-
-    shoulder_w_px = float(np.percentile(row_widths, 80))
-    shoulder_w = shoulder_w_px / float(alpha.shape[1])
-
-    return {
-        "face_cx": face_cx,
-        "face_cy": face_cy,
-        "face_w": face_w,
-        "shoulder_w": shoulder_w,
-    }
-
-
-def _load_image_from_url(url: str) -> Image.Image:
-    resp = requests.get(url, timeout=(10, 60))
-    resp.raise_for_status()
-    return ImageOps.exif_transpose(Image.open(BytesIO(resp.content))).convert("RGB")
-
-
-# Temporary demo: force monotonic “improvement” (newer = lower texture severity) for one patient.
-DEMO_MONOTONIC_TEXTURE_PATIENT = "juliano stefen"
-
-
-def _normalize_person_name(name: str) -> str:
-    return " ".join((name or "").lower().split())
-
-
-def _fetch_patient_name(patient_id: str) -> str | None:
-    if not patient_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return None
-    url = f"{SUPABASE_URL}/rest/v1/patients"
-    params = {"id": f"eq.{patient_id}", "select": "name", "limit": "1"}
-    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
-    if resp.status_code != 200:
-        return None
-    rows = resp.json()
-    return (rows[0].get("name") if rows else None) or None
-
-
-def _resolve_patient_name(scan_context: dict) -> str:
-    direct = (scan_context.get("patient_name") or "").strip()
-    if direct:
-        return direct
-    pid = scan_context.get("patient_id")
-    if pid:
-        fetched = _fetch_patient_name(pid)
-        if fetched:
-            return fetched.strip()
-    return ""
-
-
-def _count_prior_done_texture_scans(patient_id: str, current_created_at: str) -> int:
-    """Completed texture scans for this patient strictly before the current scan timestamp."""
-    if not patient_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not current_created_at:
-        return 0
-    url = f"{SUPABASE_URL}/rest/v1/scans"
-    params = {
-        "patient_id": f"eq.{patient_id}",
-        "mode": "eq.texture",
-        "status": "eq.done",
-        "created_at": f"lt.{current_created_at}",
-        "select": "id",
-    }
-    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
-    if resp.status_code != 200:
-        print(f"[demo] prior texture count failed: {resp.status_code} {resp.text[:200]}")
-        return 0
-    return len(resp.json())
-
-
-def _apply_demo_monotonic_texture_juliano(
-    scan_context: dict | None,
-    processed_angles: dict,
-    overall_texture: int,
-) -> tuple[int, dict]:
-    """Override blended texture severity so newer scans look better (lower %) for demo only."""
-    if not scan_context:
-        return overall_texture, processed_angles
-    if _normalize_person_name(_resolve_patient_name(scan_context)) != DEMO_MONOTONIC_TEXTURE_PATIENT:
-        return overall_texture, processed_angles
-    patient_id = scan_context.get("patient_id")
-    created_at = scan_context.get("created_at")
-    if not patient_id or not created_at:
-        return overall_texture, processed_angles
-    prior = _count_prior_done_texture_scans(patient_id, created_at)
-    # Older scans higher severity; each new scan steps down (caps keep a plausible band).
-    demo_severity = max(22, min(78, 60 - prior * 9))
-    print(f"[demo] Juliano texture severity override prior={prior} -> {demo_severity}% (was {overall_texture})")
-    new_angles: dict = {}
-    for key, val in processed_angles.items():
-        if isinstance(val, dict):
-            new_angles[key] = {**val, "texture_score": demo_severity}
-        else:
-            new_angles[key] = val
-    return demo_severity, new_angles
-
-
-def _fetch_scan_context(scan_id: str) -> dict | None:
-    if not scan_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return None
-    url = f"{SUPABASE_URL}/rest/v1/scans"
-    params = {
-        "id": f"eq.{scan_id}",
-        "select": "id,patient_id,created_at,mode,patient_name",
-        "limit": "1",
-    }
-    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
-    if resp.status_code != 200:
-        print(f"[align] scan context fetch failed: {resp.status_code} {resp.text[:200]}")
-        return None
-    rows = resp.json()
-    return rows[0] if rows else None
-
-
-def _fetch_baseline_scan(scan_context: dict) -> dict | None:
-    """Baseline is the first completed scan for this patient (excluding current)."""
-    patient_id = scan_context.get("patient_id")
-    current_id = scan_context.get("id")
-    if not patient_id:
-        return None
-
-    url = f"{SUPABASE_URL}/rest/v1/scans"
-    params = {
-        "patient_id": f"eq.{patient_id}",
-        "status": "eq.done",
-        "select": "id,created_at,processed_angles",
-        "order": "created_at.asc",
-        "limit": "50",
-    }
-    resp = requests.get(url, params=params, headers=_supabase_headers(), timeout=(10, 30))
-    if resp.status_code != 200:
-        print(f"[align] baseline fetch failed: {resp.status_code} {resp.text[:200]}")
-        return None
-
-    for row in resp.json():
-        if row.get("id") == current_id:
-            continue
-        angles = row.get("processed_angles")
-        if isinstance(angles, dict) and any(
-            isinstance(angles.get(k), dict) and angles.get(k, {}).get("clean_image_url")
-            for k in ANGLE_KEYS
-        ):
-            return row
-    return None
-
-
-def _build_alignment_baselines(scan_id: str) -> dict:
-    """Return per-angle baseline metrics derived from baseline clean images."""
-    scan_context = _fetch_scan_context(scan_id)
-    if not scan_context:
-        print("[align] No scan context; skipping baseline alignment")
-        return {}
-
-    baseline_scan = _fetch_baseline_scan(scan_context)
-    if not baseline_scan:
-        print("[align] No prior completed baseline scan found")
-        return {}
-
-    baseline_angles = baseline_scan.get("processed_angles") or {}
-    baselines = {}
-    for key in ANGLE_KEYS:
-        clean_url = (baseline_angles.get(key) or {}).get("clean_image_url")
-        if not clean_url:
-            continue
-        try:
-            baseline_rgb = _load_image_from_url(clean_url)
-            baseline_rgba = baseline_rgb.convert("RGBA")
-            baseline_metrics = _subject_metrics_for_alignment(baseline_rgb, baseline_rgba)
-            if baseline_metrics:
-                baselines[key] = baseline_metrics
-        except Exception as e:
-            print(f"[align] Failed baseline metric extraction for {key}: {e}")
-    print(f"[align] Baseline metrics ready for angles={list(baselines.keys())}")
-    return baselines
-
-
-def _apply_alignment(clean_rgba: Image.Image, scale: float, dx_px: float, dy_px: float) -> Image.Image:
-    w, h = clean_rgba.size
-    scaled_w = max(8, int(round(w * scale)))
-    scaled_h = max(8, int(round(h * scale)))
-    scaled = clean_rgba.resize((scaled_w, scaled_h), Image.LANCZOS)
-
-    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    x = int(round((w - scaled_w) * 0.5 + dx_px))
-    y = int(round((h - scaled_h) * 0.5 + dy_px))
-    canvas.alpha_composite(scaled, (x, y))
-    return canvas
-
-
-def _align_to_baseline(
-    original_rgb: Image.Image,
-    clean_rgba: Image.Image,
-    baseline_metrics: dict,
-    angle_label: str,
-) -> tuple[Image.Image, dict]:
-    current_metrics = _subject_metrics_for_alignment(original_rgb, clean_rgba)
-    if not current_metrics:
-        raise RuntimeError(f"{angle_label}: could not compute face/shoulder metrics for alignment")
-
-    face_scale = baseline_metrics["face_w"] / max(1e-6, current_metrics["face_w"])
-    shoulder_scale = baseline_metrics["shoulder_w"] / max(1e-6, current_metrics["shoulder_w"])
-    scale = face_scale * 0.6 + shoulder_scale * 0.4
-
-    # After scaling around center, move to match baseline face center.
-    w, h = clean_rgba.size
-    dx_norm = baseline_metrics["face_cx"] - current_metrics["face_cx"]
-    dy_norm = baseline_metrics["face_cy"] - current_metrics["face_cy"]
-    dx_px = dx_norm * w
-    dy_px = dy_norm * h
-
-    scale_delta = abs(scale - 1.0)
-    clamped = False
-    if scale_delta > ALIGNMENT_MAX_DELTA:
-        scale = 1.0 + (ALIGNMENT_MAX_DELTA if scale > 1.0 else -ALIGNMENT_MAX_DELTA)
-        clamped = True
-    if abs(dx_norm) > ALIGNMENT_MAX_DELTA:
-        dx_norm = ALIGNMENT_MAX_DELTA if dx_norm > 0 else -ALIGNMENT_MAX_DELTA
-        dx_px = dx_norm * w
-        clamped = True
-    if abs(dy_norm) > ALIGNMENT_MAX_DELTA:
-        dy_norm = ALIGNMENT_MAX_DELTA if dy_norm > 0 else -ALIGNMENT_MAX_DELTA
-        dy_px = dy_norm * h
-        clamped = True
-    if clamped:
-        print(
-            f"[align] {angle_label}: transform clamped to +/-{int(ALIGNMENT_MAX_DELTA * 100)}% "
-            f"(scale={scale:.3f}, dx={dx_norm:.3f}, dy={dy_norm:.3f})"
-        )
-
-    aligned = _apply_alignment(clean_rgba, scale, dx_px, dy_px)
-    info = {
-        "applied": True,
-        "scale": round(scale, 5),
-        "dx": round(dx_norm, 5),
-        "dy": round(dy_norm, 5),
-        "max_delta": ALIGNMENT_MAX_DELTA,
-        "clamped": clamped,
-    }
-    return aligned, info
-
-def _center_square_crop(img: Image.Image) -> Image.Image:
-    w, h = img.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = max(0, min((h - side) // 2 - int(h * 0.05), h - side))
-    crop = img.crop((left, top, left + side, top + side))
-    return crop.resize((MVP_CROP_PX, MVP_CROP_PX), Image.LANCZOS)
-
 
 def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     """MediaPipe face detection crop — handles frontal and profile angles.
-    Falls back to center crop if no face detected or mediapipe unavailable."""
-    if not MEDIAPIPE_AVAILABLE or mp is None:
-        print("[crop_to_face] mediapipe unavailable, center crop")
-        return _center_square_crop(img)
+    Falls back to center crop if no face detected."""
+    import mediapipe as mp
 
     rgb = np.array(img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -760,8 +375,11 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
         results = detector.process(rgb)
 
     if not results.detections:
-        print("[crop_to_face] No face detected, center crop")
-        return _center_square_crop(img)
+        side = min(w, h)
+        left = (w - side) // 2
+        top = max(0, min((h - side) // 2 - int(h * 0.05), h - side))
+        print(f"[crop_to_face] No face detected, center crop {side}×{side}")
+        return img.crop((left, top, left + side, top + side)).resize((800, 800), Image.LANCZOS)
 
     detection = results.detections[0]
     bb = detection.location_data.relative_bounding_box
@@ -784,26 +402,27 @@ def crop_to_face(img: Image.Image, margin: float = 0.28) -> Image.Image:
     if y2 - y1 < side: y1 = max(0, y2 - side)
 
     print(f"[crop_to_face] MediaPipe detected face, crop ({x1},{y1})-({x2},{y2})")
-    return img.crop((x1, y1, x2, y2)).resize((MVP_CROP_PX, MVP_CROP_PX), Image.LANCZOS)
+    return img.crop((x1, y1, x2, y2)).resize((800, 800), Image.LANCZOS)
 
 
-def check_image_quality_mvp(img: Image.Image) -> tuple[bool, str]:
-    """May 4 scan 270526c8: blur + face check; warn only, never block MODNet pipeline."""
+def check_image_quality(img: Image.Image) -> tuple[bool, str]:
+    """Returns (ok, reason). Rejects blurry images and images with no face."""
+    import mediapipe as mp
+
     rgb = np.array(img.convert("RGB"))
     h, w = rgb.shape[:2]
+
+    # Blur check: Laplacian variance on centre crop
     cx, cy = w // 2, h // 2
     crop_size = min(w, h) // 2
-    centre = rgb[cy - crop_size // 2 : cy + crop_size // 2, cx - crop_size // 2 : cx + crop_size // 2]
+    centre = rgb[cy - crop_size//2:cy + crop_size//2, cx - crop_size//2:cx + crop_size//2]
     gray = cv2.cvtColor(centre, cv2.COLOR_RGB2GRAY)
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
     print(f"[quality_gate] blur_score={blur_score:.1f}")
     if blur_score < 40:
         return False, f"Image too blurry (score={blur_score:.0f}, min=40)"
 
-    if not MEDIAPIPE_AVAILABLE or mp is None:
-        print("[quality_gate] mediapipe unavailable — skip face check, continue")
-        return True, "ok"
-
+    # Face presence check
     with mp.solutions.face_detection.FaceDetection(
         model_selection=1,
         min_detection_confidence=0.35,
@@ -817,33 +436,19 @@ def check_image_quality_mvp(img: Image.Image) -> tuple[bool, str]:
     return True, "ok"
 
 
-def process_single(
-    image_b64: str,
-    label: str,
-    mode: str = "redness",
-    baseline_metrics: dict | None = None,
-) -> dict:
-    """May 4 golden path (default): EXIF → normalize → MODNet on full frame → scores."""
-    del baseline_metrics  # not used in MVP pipeline
-    img_data = base64.b64decode(image_b64)
-    original = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
+def process_single(image_b64: str, label: str, mode: str = "redness") -> dict:
+    img_data  = base64.b64decode(image_b64)
+    original  = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
-    if ENABLE_INPUT_NORMALIZE:
-        original = normalize_input_size(original)
 
-    if ENABLE_QUALITY_GATE:
-        ok, reason = check_image_quality_mvp(original)
-        if not ok:
-            print(f"[process_single] Quality gate WARNING for {label}: {reason} — continuing anyway")
-    else:
-        print(f"[process_single] Quality gate skipped for {label}")
+    ok, reason = check_image_quality(original)
+    print(f"[process_single] Quality gate {'OK' if ok else 'WARN: ' + reason} for {label}")
 
-    if ENABLE_FACE_CROP:
-        original = crop_to_face(original)
-        print(f"[process_single] After face crop: {original.size}")
-
+    original  = crop_to_face(original)
+    print(f"[process_single] After face crop: {original.size}")
     clean_rgba = remove_background(original)
     print("[process_single] Background removed")
+    # Guided filter: snaps soft matting edges to actual image boundaries
     clean_rgba = refine_alpha(original, clean_rgba)
     uid = uuid.uuid4().hex[:8]
     clean_img = on_black(clean_rgba)
@@ -862,7 +467,7 @@ def process_single(
             return {
                 "clean_image_url": f_clean.result(),
                 "visia_image_url": f_visia.result(),
-                "texture_score": texture_score,
+                "texture_score":   texture_score,
             }
 
     visia_img = make_visia_duotone(clean_rgba)
@@ -870,48 +475,13 @@ def process_single(
     print(f"[process_single] redness_score={redness_score}")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f_clean = pool.submit(upload_to_supabase, clean_img, f"clean_{label}_{uid}.webp")
-        f_visia = pool.submit(upload_to_supabase, visia_img, f"visia_{label}_{uid}.webp")
+        f_clean = pool.submit(upload_to_supabase, clean_img,  f"clean_{label}_{uid}.webp")
+        f_visia = pool.submit(upload_to_supabase, visia_img,  f"visia_{label}_{uid}.webp")
         return {
             "clean_image_url": f_clean.result(),
             "visia_image_url": f_visia.result(),
-            "redness_score": redness_score,
+            "redness_score":   redness_score,
         }
-
-
-def weighted_angle_score(processed_angles: dict, angle_keys: list[str], score_key: str) -> int:
-    weighted_sum = 0.0
-    total_weight = 0.0
-    for angle in angle_keys:
-        angle_result = processed_angles.get(angle, {})
-        score = angle_result.get(score_key)
-        if not isinstance(score, (int, float)):
-            continue
-        confidence = float((angle_result.get("quality") or {}).get("confidence", 0.5))
-        weight = max(0.15, min(1.0, confidence))
-        weighted_sum += float(score) * weight
-        total_weight += weight
-    return int(round(weighted_sum / total_weight)) if total_weight > 0 else 0
-
-def stable_angle_score(processed_angles: dict, angle_keys: list[str], score_key: str) -> int:
-    """
-    Use the most stable angle (highest confidence) as the primary overall score.
-    Falls back to confidence-weighted blend if no stable candidate exists.
-    """
-    best_score = None
-    best_conf = -1.0
-    for angle in angle_keys:
-        angle_result = processed_angles.get(angle, {})
-        score = angle_result.get(score_key)
-        if not isinstance(score, (int, float)):
-            continue
-        confidence = float((angle_result.get("quality") or {}).get("confidence", 0.0))
-        if confidence > best_conf:
-            best_conf = confidence
-            best_score = int(round(float(score)))
-    if best_score is not None:
-        return best_score
-    return weighted_angle_score(processed_angles, angle_keys, score_key)
 
 def handler(job):
     import traceback
@@ -971,9 +541,9 @@ def handler(job):
                 else:
                     redness_vals = [
                         s for s in [
-                            processed_angles.get("frontal", {}).get("redness_score"),
-                            processed_angles.get("left_45", {}).get("redness_score"),
-                            processed_angles.get("right_45", {}).get("redness_score"),
+                            processed_angles.get("frontal",   {}).get("redness_score"),
+                            processed_angles.get("left_45",   {}).get("redness_score"),
+                            processed_angles.get("right_45",  {}).get("redness_score"),
                         ] if isinstance(s, (int, float))
                     ]
                     overall_score = int(sum(redness_vals) / len(redness_vals)) if redness_vals else 0
@@ -981,9 +551,9 @@ def handler(job):
 
                     texture_vals = [
                         s for s in [
-                            processed_angles.get("frontal", {}).get("texture_score"),
-                            processed_angles.get("left_45", {}).get("texture_score"),
-                            processed_angles.get("right_45", {}).get("texture_score"),
+                            processed_angles.get("frontal",   {}).get("texture_score"),
+                            processed_angles.get("left_45",   {}).get("texture_score"),
+                            processed_angles.get("right_45",  {}).get("texture_score"),
                         ] if isinstance(s, (int, float))
                     ]
                     overall_texture = int(sum(texture_vals) / len(texture_vals)) if texture_vals else 0
@@ -1005,5 +575,4 @@ def handler(job):
     return {"error": "No images provided."}
 
 
-if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler})
