@@ -27,6 +27,11 @@ except Exception as e:
 MVP_CROP_PX = 800
 ENABLE_FACE_CROP = os.environ.get("ENABLE_FACE_CROP", "false").lower() in ("1", "true", "yes")
 ENABLE_QUALITY_GATE = os.environ.get("ENABLE_QUALITY_GATE", "false").lower() in ("1", "true", "yes")
+ENABLE_INPUT_NORMALIZE = os.environ.get("ENABLE_INPUT_NORMALIZE", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 print(f"ORT version: {ort.__version__}")  # build trigger
 print(f"Available providers: {ort.get_available_providers()}")
@@ -54,7 +59,7 @@ SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
 
 print(
     f"[startup] pipeline face_crop={ENABLE_FACE_CROP} quality_gate={ENABLE_QUALITY_GATE} "
-    f"target_max_px={TARGET_MAX_PX}"
+    f"input_normalize={ENABLE_INPUT_NORMALIZE} target_max_px={TARGET_MAX_PX}"
 )
 
 
@@ -823,7 +828,8 @@ def process_single(
     img_data = base64.b64decode(image_b64)
     original = ImageOps.exif_transpose(Image.open(BytesIO(img_data))).convert("RGB")
     print(f"[process_single] Input size: {original.size}")
-    original = normalize_input_size(original)
+    if ENABLE_INPUT_NORMALIZE:
+        original = normalize_input_size(original)
 
     if ENABLE_QUALITY_GATE:
         ok, reason = check_image_quality_mvp(original)

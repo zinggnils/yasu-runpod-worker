@@ -12,9 +12,11 @@ Set on the RunPod endpoint (recommended):
 ```bash
 ENABLE_FACE_CROP=false
 ENABLE_QUALITY_GATE=false
-TARGET_MAX_PX=1920
+ENABLE_INPUT_NORMALIZE=false
 BG_REMOVAL_BACKEND=modnet
 ```
+
+`TARGET_MAX_PX` only applies when `ENABLE_INPUT_NORMALIZE=true`. Leave normalize off to keep client upload resolution (e.g. 1920×4152).
 
 ## GPU fleet
 
