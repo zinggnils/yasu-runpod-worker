@@ -9,18 +9,23 @@ import handler
 
 def image_to_b64(img: Image.Image) -> str:
     buf = BytesIO()
-    img.save(buf, format="WEBP", quality=95)
+    img.save(buf, format="JPEG", quality=95)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 class Right90AnalysisTests(unittest.TestCase):
+    def setUp(self):
+        self._upload_jpeg = handler.upload_jpeg
+        handler.upload_jpeg = lambda _img, filename: f"https://example.test/{filename}"
+
+    def tearDown(self):
+        handler.upload_jpeg = self._upload_jpeg
+
     def test_normalizes_and_crops_to_contract_sizes(self):
         img = Image.new("RGB", (2160, 2700), (185, 126, 104))
 
-        result = handler.process_right90(image_to_b64(img))
+        result = handler.process_images({"right_90": image_to_b64(img)}, {}, "redness")["right_90"]
 
-        self.assertEqual(result["portrait"].size, (2160, 2700))
-        self.assertEqual(result["crop"].size, (1000, 1000))
         self.assertEqual(result["crop_box"], {"x": 580, "y": 850, "width": 1000, "height": 1000})
         self.assertGreaterEqual(result["quality_score"], 0)
         self.assertLessEqual(result["quality_score"], 100)

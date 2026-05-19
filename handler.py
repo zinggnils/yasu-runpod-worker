@@ -10,7 +10,7 @@ from PIL import Image, ImageOps
 
 try:
     import runpod
-except ImportError:  # Allows local helper tests without the RunPod package installed.
+except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
 
@@ -26,11 +26,22 @@ ANALYSIS_CROP_SIZE = 1000
 
 
 def decode_image(image_b64: str) -> Image.Image:
-    """Decode a base64 image or data URI and apply EXIF orientation."""
     if "," in image_b64 and image_b64.lstrip().startswith("data:"):
         image_b64 = image_b64.split(",", 1)[1]
     data = base64.b64decode(image_b64)
     return ImageOps.exif_transpose(Image.open(BytesIO(data))).convert("RGB")
+
+
+def download_storage_image(path: str) -> Image.Image:
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}, timeout=90)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Storage download failed: {resp.status_code} {resp.text[:200]}")
+    return ImageOps.exif_transpose(Image.open(BytesIO(resp.content))).convert("RGB")
+
+
+def public_storage_url(path: str) -> str:
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
 
 
 def crop_to_aspect(img: Image.Image, target_width: int, target_height: int) -> Image.Image:
@@ -51,7 +62,6 @@ def crop_to_aspect(img: Image.Image, target_width: int, target_height: int) -> I
 
 
 def normalize_portrait(img: Image.Image) -> Image.Image:
-    """Normalize client capture to the app contract: 2160 x 2700 portrait."""
     portrait = crop_to_aspect(img, PORTRAIT_WIDTH, PORTRAIT_HEIGHT)
     if portrait.size != (PORTRAIT_WIDTH, PORTRAIT_HEIGHT):
         portrait = portrait.resize((PORTRAIT_WIDTH, PORTRAIT_HEIGHT), Image.Resampling.LANCZOS)
@@ -59,39 +69,47 @@ def normalize_portrait(img: Image.Image) -> Image.Image:
 
 
 def fixed_analysis_crop(img: Image.Image) -> Image.Image:
-    """Deterministic center crop matching the scanner's right-profile target."""
-    width, height = img.size
-    side = min(ANALYSIS_CROP_SIZE, width, height)
-    left = (width - side) // 2
-    top = (height - side) // 2
-    crop = img.crop((left, top, left + side, top + side))
-    if crop.size != (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE):
-        crop = crop.resize((ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE), Image.Resampling.LANCZOS)
-    return crop
+    left = (img.width - ANALYSIS_CROP_SIZE) // 2
+    top = (img.height - ANALYSIS_CROP_SIZE) // 2
+    return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
 
 
-def save_webp_bytes(img: Image.Image, quality: int = 94) -> bytes:
+def jpeg_bytes(img: Image.Image, quality: int = 98) -> bytes:
     buf = BytesIO()
-    img.save(buf, format="WEBP", quality=quality, method=4)
+    img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue()
 
 
-def upload_to_supabase(img: Image.Image, filename: str) -> str:
+def upload_jpeg(img: Image.Image, filename: str) -> str:
     path = f"processed/{filename}"
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     resp = requests.put(
         url,
-        data=save_webp_bytes(img),
+        data=jpeg_bytes(img),
         headers={
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            "Content-Type": "image/webp",
+            "Content-Type": "image/jpeg",
             "x-upsert": "true",
         },
-        timeout=60,
+        timeout=90,
     )
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Storage upload failed: {resp.status_code} {resp.text[:200]}")
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+    return public_storage_url(path)
+
+
+def make_analysis_map(img: Image.Image, mode: str = "redness") -> Image.Image:
+    arr = np.array(img.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
+
+    if mode == "texture":
+        inv = 255 - contrast
+        return Image.fromarray(cv2.cvtColor(inv, cv2.COLOR_GRAY2RGB))
+
+    bone = cv2.applyColorMap(contrast, cv2.COLORMAP_BONE)
+    return Image.fromarray(cv2.cvtColor(bone, cv2.COLOR_BGR2RGB))
 
 
 def skin_mask(rgb: np.ndarray) -> np.ndarray:
@@ -127,47 +145,33 @@ def compute_white_score(crop: Image.Image) -> int:
     return int(round(float(white.sum()) / float(mask.sum()) * 100))
 
 
-def compute_quality_score(portrait: Image.Image, crop: Image.Image) -> int:
+def compute_quality(crop: Image.Image) -> dict:
     gray = cv2.cvtColor(np.array(crop.convert("RGB")), cv2.COLOR_RGB2GRAY)
-    blur = cv2.Laplacian(gray, cv2.CV_64F).var()
+    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     contrast = float(gray.std())
     mean = float(gray.mean())
+    exposure = max(0, 100 - abs(mean - 132.0) * 1.4)
+    contrast_score = min(100, contrast * 2.5)
+    quality = int(round(0.5 * exposure + 0.5 * contrast_score))
+    warnings = []
+    if blur < 80:
+        warnings.append("Right_90 crop may be blurry")
+    if mean < 80:
+        warnings.append("Right_90 crop is underexposed")
+    if mean > 190:
+        warnings.append("Right_90 crop is overexposed")
+    if contrast < 25:
+        warnings.append("Right_90 crop has low contrast")
+    return {"quality_score": quality, "quality_warnings": warnings}
 
-    resolution_score = 100 if portrait.size == (PORTRAIT_WIDTH, PORTRAIT_HEIGHT) else 70
-    blur_score = min(100, int(blur / 3.0))
-    contrast_score = min(100, int(contrast * 2.5))
-    exposure_score = max(0, 100 - int(abs(mean - 132.0) * 1.4))
-    return int(round(0.35 * resolution_score + 0.35 * blur_score + 0.15 * contrast_score + 0.15 * exposure_score))
 
-
-def make_analysis_preview(crop: Image.Image) -> Image.Image:
-    gray = cv2.cvtColor(np.array(crop.convert("RGB")), cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast = clahe.apply(gray)
-    bone = cv2.applyColorMap(contrast, cv2.COLORMAP_BONE)
-    return Image.fromarray(cv2.cvtColor(bone, cv2.COLOR_BGR2RGB))
-
-
-def process_right90(image_b64: str) -> dict:
-    original = decode_image(image_b64)
-    portrait = normalize_portrait(original)
-    crop = fixed_analysis_crop(portrait)
-    preview = make_analysis_preview(crop)
-
-    return {
-        "portrait": portrait,
-        "crop": crop,
-        "preview": preview,
-        "redness_score": compute_redness_score(crop),
-        "white_score": compute_white_score(crop),
-        "quality_score": compute_quality_score(portrait, crop),
-        "crop_box": {
-            "x": (PORTRAIT_WIDTH - ANALYSIS_CROP_SIZE) // 2,
-            "y": (PORTRAIT_HEIGHT - ANALYSIS_CROP_SIZE) // 2,
-            "width": ANALYSIS_CROP_SIZE,
-            "height": ANALYSIS_CROP_SIZE,
-        },
-    }
+def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image.Image | None, str | None]:
+    if image_paths.get(label):
+        path = image_paths[label]
+        return download_storage_image(path), public_storage_url(path)
+    if images.get(label):
+        return decode_image(images[label]), None
+    return None, None
 
 
 def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) -> None:
@@ -175,7 +179,7 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) ->
     body = {
         "status": "done",
         "processed_angles": processed_angles,
-        "clean_image_url": right90.get("crop_image_url"),
+        "clean_image_url": right90.get("crop_image_url") or right90.get("clean_image_url"),
         "redness_image_url": right90.get("visia_image_url"),
         "image_url": right90.get("visia_image_url"),
         "redness_severity": right90.get("redness_score", 0),
@@ -195,37 +199,63 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) ->
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
 
+def process_images(images: dict, image_paths: dict, mode: str = "redness") -> dict:
+    processed = {}
+    uid = uuid.uuid4().hex[:10]
+
+    for label in ANGLE_KEYS:
+        original, original_url = load_angle_image(images, image_paths, label)
+        if original is None:
+            continue
+
+        clean = normalize_portrait(original)
+        visia = make_analysis_map(clean, mode)
+        clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg")
+        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg")
+        angle_data = {
+            "original_image_url": original_url,
+            "clean_image_url": clean_url,
+            "visia_image_url": visia_url,
+        }
+
+        if label == ANALYSIS_ANGLE:
+            crop = fixed_analysis_crop(clean)
+            crop_url = upload_jpeg(crop, f"right90_crop_{uid}.jpg")
+            angle_data.update(
+                {
+                    "crop_image_url": crop_url,
+                    "crop_box": {"x": 580, "y": 850, "width": ANALYSIS_CROP_SIZE, "height": ANALYSIS_CROP_SIZE},
+                    "redness_score": compute_redness_score(crop),
+                    "white_score": compute_white_score(crop),
+                    **compute_quality(crop),
+                }
+            )
+
+        processed[label] = angle_data
+
+    return processed
+
+
 def handler(job):
     job_input = job.get("input", {})
     scan_id = job_input.get("scan_id")
     images = job_input.get("images") or {}
+    image_paths = job_input.get("image_paths") or {}
+    mode = job_input.get("mode", "redness")
 
-    if not isinstance(images, dict):
-        return {"error": "input.images must be an object keyed by angle"}
-    if ANALYSIS_ANGLE not in images:
+    print(f"[handler] scan_id={scan_id} image_paths={list(image_paths.keys())} images={list(images.keys())}")
+
+    if not isinstance(images, dict) or not isinstance(image_paths, dict):
+        return {"error": "input.images and input.image_paths must be objects keyed by angle"}
+    if ANALYSIS_ANGLE not in images and ANALYSIS_ANGLE not in image_paths:
         return {"error": f"Missing required {ANALYSIS_ANGLE} image"}
+    if (scan_id or image_paths) and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
-    print(f"[handler] scan_id={scan_id} analyzing={ANALYSIS_ANGLE} available={list(images.keys())}")
+    processed_angles = process_images(images, image_paths, mode)
+    right90 = processed_angles.get(ANALYSIS_ANGLE, {})
 
-    result = process_right90(images[ANALYSIS_ANGLE])
-    uid = uuid.uuid4().hex[:10]
-
-    right90 = {
-        "crop_box": result["crop_box"],
-        "redness_score": result["redness_score"],
-        "white_score": result["white_score"],
-        "quality_score": result["quality_score"],
-    }
-
-    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-        right90["crop_image_url"] = upload_to_supabase(result["crop"], f"right90_crop_{uid}.webp")
-        right90["visia_image_url"] = upload_to_supabase(result["preview"], f"right90_visia_{uid}.webp")
-    else:
-        print("[handler] Supabase env missing; returning metrics without uploads")
-
-    processed_angles = {ANALYSIS_ANGLE: right90}
-
-    if scan_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    if scan_id:
         update_supabase_scan(scan_id, processed_angles, right90)
         print(f"[handler] DB updated OK for scan_id={scan_id}")
 
