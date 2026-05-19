@@ -8,18 +8,23 @@ import handler
 
 
 def image_to_b64(img: Image.Image) -> str:
+    # Tests inject inputs as PNG so we exercise the same lossless transport
+    # the device now uses; Pillow auto-detects format from bytes on the other side.
     buf = BytesIO()
-    img.save(buf, format="JPEG", quality=95)
+    img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 class Right90AnalysisTests(unittest.TestCase):
     def setUp(self):
         self._upload_jpeg = handler.upload_jpeg
-        handler.upload_jpeg = lambda _img, filename: f"https://example.test/{filename}"
+        self._upload_webp_lossless = handler.upload_webp_lossless
+        handler.upload_jpeg = lambda _img, filename, quality=95: f"https://example.test/{filename}"
+        handler.upload_webp_lossless = lambda _img, filename: f"https://example.test/{filename}"
 
     def tearDown(self):
         handler.upload_jpeg = self._upload_jpeg
+        handler.upload_webp_lossless = self._upload_webp_lossless
 
     def test_normalizes_and_crops_to_contract_sizes(self):
         img = Image.new("RGB", (2160, 2700), (185, 126, 104))

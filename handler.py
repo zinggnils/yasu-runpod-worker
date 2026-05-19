@@ -8,6 +8,13 @@ import numpy as np
 import requests
 from PIL import Image, ImageOps
 
+# Register the HEIF/HEIC opener with Pillow so Image.open() auto-detects HEIC
+# bytes (the format the iOS app uploads). Pillow's auto-detect reads the file
+# header, so no other code in this module needs to know the input format.
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
+
 try:
     import runpod
 except ImportError:  # Allows local helper tests without RunPod installed.
@@ -74,28 +81,56 @@ def fixed_analysis_crop(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
 
 
-def jpeg_bytes(img: Image.Image, quality: int = 98) -> bytes:
+def jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue()
 
 
-def upload_jpeg(img: Image.Image, filename: str) -> str:
+def webp_lossless_bytes(img: Image.Image) -> bytes:
+    """Encode image as bit-exact lossless WebP.
+
+    Pillow exposes libwebp's lossless mode explicitly: `lossless=True` keeps
+    every pixel intact, `quality` only controls compression effort in this mode
+    (0=fastest, 100=smallest), `method=6` picks the strongest entropy coder.
+    Compared to PNG, lossless WebP is typically 25-35% smaller at identical
+    fidelity, which directly reduces Supabase storage + egress per scan.
+    """
+    buf = BytesIO()
+    img.convert("RGB").save(
+        buf,
+        format="WEBP",
+        lossless=True,
+        quality=100,
+        method=6,
+    )
+    return buf.getvalue()
+
+
+def upload_bytes(data: bytes, filename: str, content_type: str) -> str:
     path = f"processed/{filename}"
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     resp = requests.put(
         url,
-        data=jpeg_bytes(img),
+        data=data,
         headers={
             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            "Content-Type": "image/jpeg",
+            "Content-Type": content_type,
             "x-upsert": "true",
         },
-        timeout=90,
+        timeout=120,
     )
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Storage upload failed: {resp.status_code} {resp.text[:200]}")
     return public_storage_url(path)
+
+
+def upload_jpeg(img: Image.Image, filename: str, quality: int = 95) -> str:
+    return upload_bytes(jpeg_bytes(img, quality=quality), filename, "image/jpeg")
+
+
+def upload_webp_lossless(img: Image.Image, filename: str) -> str:
+    return upload_bytes(webp_lossless_bytes(img), filename, "image/webp")
 
 
 def make_analysis_map(img: Image.Image, mode: str = "redness") -> Image.Image:
@@ -210,8 +245,11 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
 
         clean = normalize_portrait(original)
         visia = make_analysis_map(clean, mode)
-        clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg")
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg")
+        # Clean copy is the analysis-grade artifact: bit-exact lossless WebP so
+        # downstream analysis or re-processing never sees JPEG DCT artifacts.
+        clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
+        # Visia is a derived false-color visualization; lossless serves no purpose here.
+        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
         angle_data = {
             "original_image_url": original_url,
             "clean_image_url": clean_url,
@@ -220,7 +258,9 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
 
         if label == ANALYSIS_ANGLE:
             crop = fixed_analysis_crop(clean)
-            crop_url = upload_jpeg(crop, f"right90_crop_{uid}.jpg")
+            # right_90 crop is the actual ROI fed into redness / whiteness math
+            # if ever re-analyzed from storage. Keep it lossless.
+            crop_url = upload_webp_lossless(crop, f"right90_crop_{uid}.webp")
             angle_data.update(
                 {
                     "crop_image_url": crop_url,
