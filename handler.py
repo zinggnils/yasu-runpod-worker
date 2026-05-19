@@ -92,8 +92,8 @@ MATTING_SESSION = _init_matting()
 
 
 def run_matting(img_rgb: Image.Image):
-    """Run RVM on a single image. Returns uint8 alpha matte at the input
-    resolution, or None if matting is disabled.
+    """Run RVM on a single image. Returns (fgr_uint8_HWC, pha_uint8_HW) at
+    the input resolution, or None if matting is disabled.
 
     RVM's ONNX export is built for video, so the I/O signature is:
         inputs:  src (NCHW float32 [0,1]), r1i..r4i (recurrent states),
@@ -102,6 +102,13 @@ def run_matting(img_rgb: Image.Image):
     For still images we pass (1,1,1,1) zero tensors for the recurrent
     states and discard the returned states. This matches the official
     repo's recommended single-frame usage.
+
+    We keep `fgr` (color-decontaminated foreground) in addition to `pha`
+    because RVM was trained to produce a foreground RGB with the
+    background's color contribution removed at semi-transparent hair
+    pixels. Compositing `fgr * pha` (vs `original_rgb * pha`) eliminates
+    background color spill into hair strands — a quality win at zero
+    additional inference cost.
     """
     if MATTING_SESSION is None:
         return None
@@ -134,11 +141,22 @@ def run_matting(img_rgb: Image.Image):
         "r4i": rec,
         "downsample_ratio": downsample,
     }
-    # Outputs in repo order: [fgr, pha, r1o, r2o, r3o, r4o]. We only need pha.
+    # Outputs in repo order: [fgr, pha, r1o, r2o, r3o, r4o].
     outputs = MATTING_SESSION.run(None, inputs)
-    pha = outputs[1][0, 0]
+    fgr_chw = outputs[0][0]  # (3, th, tw) float [0,1]
+    pha = outputs[1][0, 0]  # (th, tw) float [0,1]
+
+    # Resize both back to the source resolution. fgr needs HWC layout for
+    # cv2.resize's multi-channel handling. We force contiguity after the
+    # transpose so cv2's C-side doesn't pay for an internal copy.
+    fgr_hwc = np.ascontiguousarray(np.transpose(fgr_chw, (1, 2, 0)))
+    fgr_full = cv2.resize(fgr_hwc, (w, h), interpolation=cv2.INTER_LINEAR)
     pha_full = cv2.resize(pha, (w, h), interpolation=cv2.INTER_LINEAR)
-    return np.clip(pha_full * 255.0, 0, 255).astype(np.uint8)
+
+    return (
+        np.clip(fgr_full * 255.0, 0, 255).astype(np.uint8),
+        np.clip(pha_full * 255.0, 0, 255).astype(np.uint8),
+    )
 
 
 def _guided_filter_alpha(
@@ -203,16 +221,28 @@ def remove_background_and_finish(img_rgb: Image.Image):
     Returns (finished_rgb, alpha_uint8 or None). If matting is unavailable
     we degrade gracefully and only apply the Clarity/Sharpen finish on the
     untouched RGB image so the pipeline still produces output.
+
+    Crucially, we composite using RVM's `fgr` output (color-decontaminated
+    foreground) rather than the original RGB. At semi-transparent hair
+    pixels RVM has already subtracted off the background's color
+    contribution — so `fgr * pha` produces cleaner hair strands on black
+    than `original_rgb * pha` does, with no extra inference work.
     """
-    alpha = run_matting(img_rgb)
-    if alpha is None:
+    matting = run_matting(img_rgb)
+    if matting is None:
         return _clarity_and_sharpen(img_rgb), None
 
+    fgr, alpha = matting
+
+    # Refine the upsampled matte against the source luma so the alpha
+    # snaps to real image edges. Use the original RGB (not fgr) as the
+    # guide because hair strands are most visible against the actual
+    # background luminance.
     rgb_arr = np.array(img_rgb.convert("RGB"))
     gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
     alpha = _guided_filter_alpha(gray, alpha, radius=4, eps=1e-3)
 
-    on_black = _composite_on_black(rgb_arr, alpha)
+    on_black = _composite_on_black(fgr, alpha)
     finished = _clarity_and_sharpen(on_black)
     return finished, alpha
 
@@ -261,9 +291,104 @@ def normalize_portrait(img: Image.Image) -> Image.Image:
 
 
 def fixed_analysis_crop(img: Image.Image) -> Image.Image:
+    """Fallback when face detection is unavailable: dead-center 1000x1000."""
     left = (img.width - ANALYSIS_CROP_SIZE) // 2
     top = (img.height - ANALYSIS_CROP_SIZE) // 2
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
+
+
+# ---------------------------------------------------------------------------
+# Face-aware analysis crop (anchors the ROI to the actual face, not the frame)
+# ---------------------------------------------------------------------------
+# A fixed center crop was a constant source of variance for the right_90
+# metrics — a few cm of head shift would push the cheek partly outside the
+# ROI and pull hair / background in. Anchoring to the detected face bbox
+# eliminates that variance: the same skin pixels land in the ROI on every
+# capture regardless of where the user framed their head.
+#
+# MediaPipe Face Detection model_selection=1 ("full range") handles distances
+# up to ~5m and is more robust to side-profile poses than model_selection=0.
+# We also drop min_detection_confidence to 0.3 so strict 90° profiles, which
+# the model is less confident on, still detect.
+try:
+    import mediapipe as mp  # type: ignore
+
+    FACE_DETECTOR = mp.solutions.face_detection.FaceDetection(
+        model_selection=1,
+        min_detection_confidence=0.3,
+    )
+    print(
+        f"[face] MediaPipe Face Detection initialized "
+        f"(model=full_range, conf=0.3, mp={mp.__version__})"
+    )
+except Exception as exc:  # noqa: BLE001
+    FACE_DETECTOR = None
+    print(f"[face] MediaPipe unavailable; analysis crop falls back to fixed center: {exc}")
+
+
+def _detect_face_center(portrait_rgb: Image.Image) -> tuple[int, int] | None:
+    """Return the pixel-space (cx, cy) of the detected face bbox center,
+    or None when no face is found / MediaPipe is unavailable."""
+    if FACE_DETECTOR is None:
+        return None
+    try:
+        rgb = np.array(portrait_rgb.convert("RGB"))
+        # MediaPipe expects RGB input; we already have RGB.
+        results = FACE_DETECTOR.process(rgb)
+        if not results.detections:
+            return None
+        # Pick the highest-score detection. For a single subject this is
+        # almost always the only one.
+        det = max(
+            results.detections,
+            key=lambda d: d.score[0] if d.score else 0.0,
+        )
+        bbox = det.location_data.relative_bounding_box
+        w, h = portrait_rgb.size
+        cx = int((bbox.xmin + bbox.width / 2.0) * w)
+        cy = int((bbox.ymin + bbox.height / 2.0) * h)
+        return cx, cy
+    except Exception as exc:  # noqa: BLE001
+        print(f"[face] detection error, falling back to center: {exc}")
+        return None
+
+
+def compute_analysis_crop_box(
+    portrait: Image.Image, alpha: np.ndarray | None
+) -> tuple[tuple[int, int, int, int], float, bool]:
+    """Decide the 1000x1000 analysis crop coordinates for this portrait.
+
+    Returns (box, alpha_coverage, used_face_detection):
+      box: (left, top, right, bottom) clamped inside the portrait
+      alpha_coverage: fraction of the box covered by alpha > 128 (face
+        framing quality metric). 1.0 when alpha is None.
+      used_face_detection: True if MediaPipe gave us the anchor; False if
+        we fell back to fixed center.
+
+    The box is always clamped so it never extends past the portrait edges,
+    which means callers can crop directly without a bounds check.
+    """
+    w, h = portrait.size
+    half = ANALYSIS_CROP_SIZE // 2
+
+    center = _detect_face_center(portrait)
+    used_face = center is not None
+    if center is None:
+        center = (w // 2, h // 2)
+
+    cx, cy = center
+    left = max(0, min(w - ANALYSIS_CROP_SIZE, cx - half))
+    top = max(0, min(h - ANALYSIS_CROP_SIZE, cy - half))
+    box = (left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE)
+
+    coverage = 1.0
+    if alpha is not None:
+        alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
+        coverage = float((alpha_crop > 128).sum()) / float(
+            ANALYSIS_CROP_SIZE * ANALYSIS_CROP_SIZE
+        )
+
+    return box, coverage, used_face
 
 
 def jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
@@ -491,27 +616,41 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label == ANALYSIS_ANGLE:
-        crop = fixed_analysis_crop(clean)
+        # Crop box and framing coverage were pre-computed in Phase 1 so
+        # MediaPipe inference doesn't race with the parallel encode pool.
+        crop_box: tuple[int, int, int, int] = prepared["analysis_crop_box"]
+        framing_coverage: float = prepared["analysis_framing_coverage"]
+        face_anchored: bool = prepared["analysis_face_anchored"]
+        left, top, right, bottom = crop_box
+
+        crop = clean.crop(crop_box)
         alpha_crop = None
         if alpha is not None:
-            left = (clean.width - ANALYSIS_CROP_SIZE) // 2
-            top = (clean.height - ANALYSIS_CROP_SIZE) // 2
-            alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
+            alpha_crop = alpha[top:bottom, left:right]
+
         crop_url = upload_webp_lossless(crop, f"right90_crop_{uid}.webp")
         angle_data.update(
             {
                 "crop_image_url": crop_url,
                 "crop_box": {
-                    "x": (clean.width - ANALYSIS_CROP_SIZE) // 2,
-                    "y": (clean.height - ANALYSIS_CROP_SIZE) // 2,
+                    "x": left,
+                    "y": top,
                     "width": ANALYSIS_CROP_SIZE,
                     "height": ANALYSIS_CROP_SIZE,
                 },
+                "face_anchored": face_anchored,
+                "framing_coverage": round(framing_coverage, 3),
                 "redness_score": compute_redness_score(crop, alpha_crop),
                 "white_score": compute_white_score(crop, alpha_crop),
                 **compute_quality(crop),
             }
         )
+        # Surface a soft warning if the ROI overlaps the face poorly —
+        # the app can prompt for a retake without us rejecting the scan.
+        if framing_coverage < 0.45:
+            angle_data.setdefault("quality_warnings", []).append(
+                "Right_90 framing low: face does not fill the analysis ROI."
+            )
 
     print(
         f"[handler] {label} OK"
@@ -542,14 +681,30 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
             continue
         portrait = normalize_portrait(original)
         clean, alpha = remove_background_and_finish(portrait)
-        prepared_angles.append(
-            {
-                "label": label,
-                "original_url": original_url,
-                "clean": clean,
-                "alpha": alpha,
-            }
-        )
+
+        item: dict = {
+            "label": label,
+            "original_url": original_url,
+            "clean": clean,
+            "alpha": alpha,
+        }
+
+        # Face-anchored analysis crop only matters for right_90; running
+        # MediaPipe on the other angles would just burn ~30 ms each for
+        # nothing. Doing it sequentially in Phase 1 also sidesteps
+        # MediaPipe's non-thread-safe `process()`.
+        if label == ANALYSIS_ANGLE:
+            crop_box, coverage, face_anchored = compute_analysis_crop_box(clean, alpha)
+            item["analysis_crop_box"] = crop_box
+            item["analysis_framing_coverage"] = coverage
+            item["analysis_face_anchored"] = face_anchored
+            print(
+                f"[handler] {label} crop "
+                f"box={crop_box} cov={coverage:.2f} "
+                f"{'face-anchored' if face_anchored else 'center-fallback'}"
+            )
+
+        prepared_angles.append(item)
         print(
             f"[handler] {label} matting "
             + ("OK" if alpha is not None else "SKIPPED (no RVM model)")

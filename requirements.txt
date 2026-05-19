@@ -4,3 +4,4 @@ pillow
 pillow-heif
 opencv-python-headless
 onnxruntime==1.17.1
+mediapipe==0.10.9
