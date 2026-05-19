@@ -35,101 +35,121 @@ PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
 
 # ---------------------------------------------------------------------------
-# MODNet portrait matting (May-4 golden pipeline)
+# Robust Video Matting (RVM) portrait matting
 # ---------------------------------------------------------------------------
-# We bake `modnet_photographic.onnx` into the image at /root/.modnet/ (see
-# Dockerfile). ORT CPU inference at 512px input takes ~400-600 ms per angle
-# on a typical RunPod CPU pod; we run angles sequentially so ORT's internal
-# thread pool can saturate all cores without contention.
-MODNET_MODEL_PATH = os.environ.get(
-    "MODNET_MODEL_PATH", "/root/.modnet/modnet_photographic.onnx"
+# Upgrade over MODNet specifically targeting hair-edge quality. Same MIT
+# license and ONNX deployment story but produces noticeably cleaner hair
+# strands and ear/jaw transitions. We feed each angle independently — RVM
+# is a video model but accepts a single frame when the recurrent state is
+# zeroed and not threaded between calls.
+RVM_MODEL_PATH = os.environ.get(
+    "RVM_MODEL_PATH", "/root/.rvm/rvm_mobilenetv3_fp32.onnx"
 )
-MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
+# Long edge we resize each angle to before inference. 720 keeps CPU
+# inference under ~700 ms per angle on a typical RunPod CPU pod while
+# still resolving individual hair strands. The alpha matte is bilinearly
+# upsampled back to the source resolution and then snapped to image edges
+# with the guided filter below.
+RVM_LONG_SIDE = int(os.environ.get("RVM_LONG_SIDE", "720"))
+# Internal downsample ratio fed to RVM as one of its inputs. The RVM docs
+# specify the internal downsampled resolution should sit between 256 and
+# 512 px for clean hair matting. For our 576x720 (after aspect-preserving
+# resize of a portrait) ratio 0.5 lands the internal feature map at
+# 288x360 — well inside the sweet spot. 0.375 (the 1280x720 example value
+# from the docs) would put it at 216x270, below 256.
+RVM_DOWNSAMPLE = float(os.environ.get("RVM_DOWNSAMPLE", "0.5"))
 # Sharpen strength for the final clean image. 1.15 matches the May-4 look:
 # subtle Clarity pass + UnsharpMask makes pores/skin texture pop without
 # halos around facial features.
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
 
 
-def _init_modnet():
-    model_path = Path(MODNET_MODEL_PATH)
+def _init_matting():
+    model_path = Path(RVM_MODEL_PATH)
     if not model_path.exists() or model_path.stat().st_size == 0:
-        print(f"[modnet] Model not found at {model_path}; background removal DISABLED")
+        print(f"[matting] Model not found at {model_path}; background removal DISABLED")
         return None
     try:
         opts = ort.SessionOptions()
-        # Saturate the CPU on serial inference; we never run MODNet from
-        # multiple threads simultaneously.
+        # Saturate the CPU on serial inference; we never run RVM from
+        # multiple threads simultaneously, so giving ORT all cores is safe.
         opts.intra_op_num_threads = max(1, (os.cpu_count() or 4))
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess = ort.InferenceSession(
             str(model_path), opts, providers=["CPUExecutionProvider"]
         )
-        print(f"[modnet] Session initialized providers={sess.get_providers()}")
+        print(
+            f"[matting] RVM session initialized providers={sess.get_providers()} "
+            f"inputs={[i.name for i in sess.get_inputs()]}"
+        )
         return sess
     except Exception as exc:  # noqa: BLE001
-        print(f"[modnet] Init failed, background removal DISABLED: {exc}")
+        print(f"[matting] Init failed, background removal DISABLED: {exc}")
         return None
 
 
-MODNET_SESSION = _init_modnet()
+MATTING_SESSION = _init_matting()
 
 
-def _modnet_target_size(width: int, height: int, session) -> tuple[int, int]:
-    """Pick the input size MODNet will actually run at.
+def run_matting(img_rgb: Image.Image):
+    """Run RVM on a single image. Returns uint8 alpha matte at the input
+    resolution, or None if matting is disabled.
 
-    Some MODNet ONNX exports lock the input to 512x512; others expose dynamic
-    H/W. When dynamic, pick a 32-multiple keeping the source aspect ratio with
-    the long side near MODNET_INPUT_SIZE — the matte upsamples cleanly back
-    to the original resolution via bilinear.
+    RVM's ONNX export is built for video, so the I/O signature is:
+        inputs:  src (NCHW float32 [0,1]), r1i..r4i (recurrent states),
+                 downsample_ratio (scalar float32)
+        outputs: fgr, pha, r1o..r4o
+    For still images we pass (1,1,1,1) zero tensors for the recurrent
+    states and discard the returned states. This matches the official
+    repo's recommended single-frame usage.
     """
-    input_shape = session.get_inputs()[0].shape
-    if (
-        len(input_shape) == 4
-        and isinstance(input_shape[2], int)
-        and isinstance(input_shape[3], int)
-    ):
-        return int(input_shape[3]), int(input_shape[2])
-
-    if width >= height:
-        new_w = MODNET_INPUT_SIZE
-        new_h = int(round(height / width * MODNET_INPUT_SIZE))
-    else:
-        new_h = MODNET_INPUT_SIZE
-        new_w = int(round(width / height * MODNET_INPUT_SIZE))
-    new_w = max(32, new_w - (new_w % 32))
-    new_h = max(32, new_h - (new_h % 32))
-    return new_w, new_h
-
-
-def run_modnet(img_rgb: Image.Image):
-    """Return uint8 alpha matte at the input resolution, or None if disabled."""
-    if MODNET_SESSION is None:
+    if MATTING_SESSION is None:
         return None
+
     rgb = np.array(img_rgb.convert("RGB"))
     h, w = rgb.shape[:2]
-    tw, th = _modnet_target_size(w, h, MODNET_SESSION)
+    scale = RVM_LONG_SIDE / float(max(w, h))
+    tw = max(64, int(round(w * scale)))
+    th = max(64, int(round(h * scale)))
+    # Round to multiples of 4 — RVM's internal feature pyramid expects the
+    # input dims to halve cleanly a couple of times.
+    tw -= tw % 4
+    th -= th % 4
     resized = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_AREA)
-    # MODNet normalization: (x/255 - 0.5) / 0.5 = (x/127.5) - 1, NCHW float32.
-    tensor = ((resized.astype(np.float32) / 255.0) - 0.5) / 0.5
-    tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
 
-    input_name = MODNET_SESSION.get_inputs()[0].name
-    output_names = [o.name for o in MODNET_SESSION.get_outputs()]
-    matte = MODNET_SESSION.run(output_names, {input_name: tensor})[0]
-    matte = np.squeeze(matte)
-    matte = cv2.resize(matte, (w, h), interpolation=cv2.INTER_LINEAR)
-    return np.clip(matte * 255.0, 0, 255).astype(np.uint8)
+    # NCHW float32 in [0, 1] — RVM does NOT use MODNet's [-1, 1] norm.
+    src = resized.astype(np.float32) / 255.0
+    src = np.transpose(src, (2, 0, 1))[None, ...]
+
+    # Zero recurrent state for single-frame inference. The (1,1,1,1) shape
+    # is what the upstream ONNX inference example uses.
+    rec = np.zeros((1, 1, 1, 1), dtype=np.float32)
+    downsample = np.array([RVM_DOWNSAMPLE], dtype=np.float32)
+
+    inputs = {
+        "src": src,
+        "r1i": rec,
+        "r2i": rec,
+        "r3i": rec,
+        "r4i": rec,
+        "downsample_ratio": downsample,
+    }
+    # Outputs in repo order: [fgr, pha, r1o, r2o, r3o, r4o]. We only need pha.
+    outputs = MATTING_SESSION.run(None, inputs)
+    pha = outputs[1][0, 0]
+    pha_full = cv2.resize(pha, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(pha_full * 255.0, 0, 255).astype(np.uint8)
 
 
 def _guided_filter_alpha(
-    guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 6, eps: float = 1e-3
+    guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 4, eps: float = 1e-3
 ) -> np.ndarray:
     """Edge-aware refinement: snaps soft matte boundaries to real image edges.
 
-    Eliminates the soft halo / fringing that pure MODNet output exhibits
-    around hair and ears. Implementation is the standard guided filter
-    (He et al.) applied with the source luma as the guide.
+    RVM already produces sharper hair edges than MODNet, so we run guided
+    filtering with a smaller radius (4 vs 6) — just enough to snap the
+    bilinear-upsampled matte to source-image edges without over-smoothing
+    the strand detail RVM resolved.
     """
 
     def box(I: np.ndarray, r: int) -> np.ndarray:
@@ -178,19 +198,19 @@ def _clarity_and_sharpen(img: Image.Image) -> Image.Image:
 
 
 def remove_background_and_finish(img_rgb: Image.Image):
-    """Run MODNet + guided-filter refinement + Clarity/Sharpen finish.
+    """Run RVM + guided-filter refinement + Clarity/Sharpen finish.
 
-    Returns (finished_rgb, alpha_uint8 or None). If MODNet is unavailable
+    Returns (finished_rgb, alpha_uint8 or None). If matting is unavailable
     we degrade gracefully and only apply the Clarity/Sharpen finish on the
     untouched RGB image so the pipeline still produces output.
     """
-    alpha = run_modnet(img_rgb)
+    alpha = run_matting(img_rgb)
     if alpha is None:
         return _clarity_and_sharpen(img_rgb), None
 
     rgb_arr = np.array(img_rgb.convert("RGB"))
     gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
-    alpha = _guided_filter_alpha(gray, alpha, radius=6, eps=1e-3)
+    alpha = _guided_filter_alpha(gray, alpha, radius=4, eps=1e-3)
 
     on_black = _composite_on_black(rgb_arr, alpha)
     finished = _clarity_and_sharpen(on_black)
@@ -347,8 +367,8 @@ def skin_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def _face_mask(rgb: np.ndarray, alpha_crop: np.ndarray | None) -> np.ndarray:
-    """Combine brightness gating with MODNet alpha so scoring only sees
-    actual face pixels — no background, no hair edge."""
+    """Combine brightness gating with the RVM alpha matte so scoring only
+    sees actual face pixels — no background, no hair edge."""
     mask = skin_mask(rgb)
     if alpha_crop is not None:
         # alpha > 200 -> definite foreground (avoids matte halo pixels).
@@ -440,7 +460,7 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) ->
 def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     """I/O- and CPU-bound work that runs in parallel across angles.
 
-    `prepared` carries everything MODNet/normalize already produced; this
+    `prepared` carries everything matting/normalize already produced; this
     stage only does false-color rendering, WebP/JPEG encoding, and storage
     uploads — all libwebp/libjpeg/requests calls drop the GIL so a
     ThreadPoolExecutor gives real parallelism here.
@@ -504,9 +524,10 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
     """Two-phase pipeline:
 
     Phase 1 (sequential): per angle — download original, normalize to the
-        portrait frame, run MODNet matting + Clarity/UnsharpMask finish.
-        MODNet on CPU already saturates all cores via ORT's intra-op pool;
-        running multiple inferences concurrently would thrash, so serialize.
+        portrait frame, run RVM matting + guided-filter refine + Clarity
+        / UnsharpMask finish. RVM on CPU already saturates all cores via
+        ORT's intra-op pool; running multiple inferences concurrently would
+        thrash, so we serialize this phase.
 
     Phase 2 (parallel): build the false-color visia map, encode WebP/JPEG,
         and upload to Supabase Storage. All of these release the GIL during
@@ -531,7 +552,7 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
         )
         print(
             f"[handler] {label} matting "
-            + ("OK" if alpha is not None else "SKIPPED (no MODNet)")
+            + ("OK" if alpha is not None else "SKIPPED (no RVM model)")
         )
 
     processed: dict = {}
