@@ -3,3 +3,4 @@ runpod
 pillow
 pillow-heif
 opencv-python-headless
+onnxruntime==1.17.1
