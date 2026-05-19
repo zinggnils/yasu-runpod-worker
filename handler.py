@@ -35,43 +35,32 @@ PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
 
 # ---------------------------------------------------------------------------
-# Robust Video Matting (RVM) portrait matting
+# MODNet portrait matting (the simple, fast, May-4 golden pipeline)
 # ---------------------------------------------------------------------------
-# Upgrade over MODNet specifically targeting hair-edge quality. Same MIT
-# license and ONNX deployment story but produces noticeably cleaner hair
-# strands and ear/jaw transitions. We feed each angle independently — RVM
-# is a video model but accepts a single frame when the recurrent state is
-# zeroed and not threaded between calls.
-RVM_MODEL_PATH = os.environ.get(
-    "RVM_MODEL_PATH", "/root/.rvm/rvm_mobilenetv3_fp32.onnx"
+# Single-image ONNX model, no recurrent state, no aux inputs. Each angle is
+# independent. Inference at 512 px long edge runs ~250 ms per angle on a
+# typical RunPod CPU pod, and the matte is then refined in two passes:
+#   1. guided filter against the source luma  -> snaps to real image edges
+#   2. studio finish (Adobe-Express style)    -> closes pinholes, kills
+#      outer halo glow, smoothstep edge curve, sub-pixel feather
+MODNET_MODEL_PATH = os.environ.get(
+    "MODNET_MODEL_PATH", "/root/.modnet/modnet_photographic.onnx"
 )
-# Long edge we resize each angle to before inference. 720 keeps CPU
-# inference under ~700 ms per angle on a typical RunPod CPU pod while
-# still resolving individual hair strands. The alpha matte is bilinearly
-# upsampled back to the source resolution and then snapped to image edges
-# with the guided filter below.
-RVM_LONG_SIDE = int(os.environ.get("RVM_LONG_SIDE", "720"))
-# Internal downsample ratio fed to RVM as one of its inputs. The RVM docs
-# specify the internal downsampled resolution should sit between 256 and
-# 512 px for clean hair matting. For our 576x720 (after aspect-preserving
-# resize of a portrait) ratio 0.5 lands the internal feature map at
-# 288x360 — well inside the sweet spot. 0.375 (the 1280x720 example value
-# from the docs) would put it at 216x270, below 256.
-RVM_DOWNSAMPLE = float(os.environ.get("RVM_DOWNSAMPLE", "0.5"))
-# Sharpen strength for the final clean image. 1.15 matches the May-4 look:
-# subtle Clarity pass + UnsharpMask makes pores/skin texture pop without
+MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
+# Clarity/sharpen strength for the final clean image. 1.15 matches May-4:
+# subtle midtone clarity + UnsharpMask makes pores/skin texture pop without
 # halos around facial features.
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
 
 
 def _init_matting():
-    model_path = Path(RVM_MODEL_PATH)
+    model_path = Path(MODNET_MODEL_PATH)
     if not model_path.exists() or model_path.stat().st_size == 0:
-        print(f"[matting] Model not found at {model_path}; background removal DISABLED")
+        print(f"[matting] MODNet not found at {model_path}; background removal DISABLED")
         return None
     try:
         opts = ort.SessionOptions()
-        # Saturate the CPU on serial inference; we never run RVM from
+        # Saturate the CPU on serial inference. We never run MODNet from
         # multiple threads simultaneously, so giving ORT all cores is safe.
         opts.intra_op_num_threads = max(1, (os.cpu_count() or 4))
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -79,7 +68,7 @@ def _init_matting():
             str(model_path), opts, providers=["CPUExecutionProvider"]
         )
         print(
-            f"[matting] RVM session initialized providers={sess.get_providers()} "
+            f"[matting] MODNet session initialized providers={sess.get_providers()} "
             f"inputs={[i.name for i in sess.get_inputs()]}"
         )
         return sess
@@ -91,83 +80,52 @@ def _init_matting():
 MATTING_SESSION = _init_matting()
 
 
+def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
+    """Resize to MODNET_INPUT_SIZE long edge, with both sides multiples of
+    32 so MODNet's 5-stage downsample inside the network halves cleanly."""
+    scale = MODNET_INPUT_SIZE / float(max(width, height))
+    tw = max(32, int(round(width * scale)))
+    th = max(32, int(round(height * scale)))
+    tw -= tw % 32
+    th -= th % 32
+    return tw, th
+
+
 def run_matting(img_rgb: Image.Image):
-    """Run RVM on a single image. Returns (fgr_uint8_HWC, pha_uint8_HW) at
-    the input resolution, or None if matting is disabled.
+    """Run MODNet on a single image. Returns uint8 alpha at source resolution,
+    or None if matting is disabled.
 
-    RVM's ONNX export is built for video, so the I/O signature is:
-        inputs:  src (NCHW float32 [0,1]), r1i..r4i (recurrent states),
-                 downsample_ratio (scalar float32)
-        outputs: fgr, pha, r1o..r4o
-    For still images we pass (1,1,1,1) zero tensors for the recurrent
-    states and discard the returned states. This matches the official
-    repo's recommended single-frame usage.
-
-    We keep `fgr` (color-decontaminated foreground) in addition to `pha`
-    because RVM was trained to produce a foreground RGB with the
-    background's color contribution removed at semi-transparent hair
-    pixels. Compositing `fgr * pha` (vs `original_rgb * pha`) eliminates
-    background color spill into hair strands — a quality win at zero
-    additional inference cost.
+    MODNet's ONNX export takes one input (the RGB image as NCHW float32 in
+    [-1, 1]) and returns the alpha matte. No recurrent state, no aux inputs.
     """
     if MATTING_SESSION is None:
         return None
 
     rgb = np.array(img_rgb.convert("RGB"))
     h, w = rgb.shape[:2]
-    scale = RVM_LONG_SIDE / float(max(w, h))
-    tw = max(64, int(round(w * scale)))
-    th = max(64, int(round(h * scale)))
-    # Round to multiples of 4 — RVM's internal feature pyramid expects the
-    # input dims to halve cleanly a couple of times.
-    tw -= tw % 4
-    th -= th % 4
+    tw, th = _modnet_target_size(w, h)
     resized = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_AREA)
 
-    # NCHW float32 in [0, 1] — RVM does NOT use MODNet's [-1, 1] norm.
-    src = resized.astype(np.float32) / 255.0
-    src = np.transpose(src, (2, 0, 1))[None, ...]
+    # NCHW float32 in [-1, 1] — MODNet's normalization.
+    src = (resized.astype(np.float32) - 127.5) / 127.5
+    src = np.ascontiguousarray(np.transpose(src, (2, 0, 1))[None, ...])
 
-    # Zero recurrent state for single-frame inference. The (1,1,1,1) shape
-    # is what the upstream ONNX inference example uses.
-    rec = np.zeros((1, 1, 1, 1), dtype=np.float32)
-    downsample = np.array([RVM_DOWNSAMPLE], dtype=np.float32)
-
-    inputs = {
-        "src": src,
-        "r1i": rec,
-        "r2i": rec,
-        "r3i": rec,
-        "r4i": rec,
-        "downsample_ratio": downsample,
-    }
-    # Outputs in repo order: [fgr, pha, r1o, r2o, r3o, r4o].
-    outputs = MATTING_SESSION.run(None, inputs)
-    fgr_chw = outputs[0][0]  # (3, th, tw) float [0,1]
-    pha = outputs[1][0, 0]  # (th, tw) float [0,1]
-
-    # Resize both back to the source resolution. fgr needs HWC layout for
-    # cv2.resize's multi-channel handling. We force contiguity after the
-    # transpose so cv2's C-side doesn't pay for an internal copy.
-    fgr_hwc = np.ascontiguousarray(np.transpose(fgr_chw, (1, 2, 0)))
-    fgr_full = cv2.resize(fgr_hwc, (w, h), interpolation=cv2.INTER_LINEAR)
-    pha_full = cv2.resize(pha, (w, h), interpolation=cv2.INTER_LINEAR)
-
-    return (
-        np.clip(fgr_full * 255.0, 0, 255).astype(np.uint8),
-        np.clip(pha_full * 255.0, 0, 255).astype(np.uint8),
-    )
+    input_name = MATTING_SESSION.get_inputs()[0].name
+    output_name = MATTING_SESSION.get_outputs()[0].name
+    outputs = MATTING_SESSION.run([output_name], {input_name: src})
+    alpha = outputs[0][0, 0]  # (th, tw) float in [0, 1]
+    alpha_full = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(alpha_full * 255.0, 0, 255).astype(np.uint8)
 
 
 def _guided_filter_alpha(
-    guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 4, eps: float = 1e-3
+    guide_gray: np.ndarray, alpha: np.ndarray, radius: int = 6, eps: float = 1e-3
 ) -> np.ndarray:
     """Edge-aware refinement: snaps soft matte boundaries to real image edges.
 
-    RVM already produces sharper hair edges than MODNet, so we run guided
-    filtering with a smaller radius (4 vs 6) — just enough to snap the
-    bilinear-upsampled matte to source-image edges without over-smoothing
-    the strand detail RVM resolved.
+    Radius 6 matches the May-4 MODNet pipeline — wide enough to let the
+    bilinear-upsampled matte snap cleanly to source-image edges without
+    over-smoothing fine hair detail.
     """
 
     def box(I: np.ndarray, r: int) -> np.ndarray:
@@ -195,6 +153,41 @@ def _composite_on_black(rgb: np.ndarray, alpha: np.ndarray) -> Image.Image:
     return Image.fromarray(composed, mode="RGB")
 
 
+def _studio_finish_alpha(alpha: np.ndarray) -> np.ndarray:
+    """Second-pass cleanup on the alpha matte — Adobe Express "auto" style.
+
+    The matting model gives a usable matte, but for a photo-studio
+    pure-black-background look we also want:
+      - no pinholes inside the foreground (close 1-2 px holes)
+      - no specks floating outside the subject (open small islands)
+      - no outer halo glow (kill very low alpha values)
+      - a tight but smooth edge transition (smoothstep curve + soft feather)
+    All ops are O(N) numpy/cv2 — total cost is ~20-40 ms at 2160x2700.
+    """
+    # 1. Morphological cleanup. 3x3 kernel preserves thin hair strands while
+    #    closing 1-2 px pinholes inside the FG and removing matching specks
+    #    outside it.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, kernel, iterations=1)
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 2. Contrast curve over the soft edge band. Anything below 20/255 is
+    #    treated as background (kills outer haze), anything above 235/255
+    #    stays full FG. The middle band gets a smoothstep so the transition
+    #    tightens without becoming a hard cut — strands stay strands.
+    af = alpha.astype(np.float32) / 255.0
+    lo, hi = 20.0 / 255.0, 235.0 / 255.0
+    af = np.where(af < lo, 0.0, af)
+    af = np.clip((af - lo) / (hi - lo), 0.0, 1.0)
+    af = af * af * (3.0 - 2.0 * af)  # smoothstep
+
+    # 3. Sub-pixel feather so the final composite doesn't show pixel
+    #    staircase on close inspection. sigma=0.8 is enough.
+    alpha = (af * 255.0).astype(np.uint8)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=0.8)
+    return alpha
+
+
 def _clarity_and_sharpen(img: Image.Image) -> Image.Image:
     """May-4 finish: subtle Clarity (large-radius high-pass) + UnsharpMask.
 
@@ -216,33 +209,30 @@ def _clarity_and_sharpen(img: Image.Image) -> Image.Image:
 
 
 def remove_background_and_finish(img_rgb: Image.Image):
-    """Run RVM + guided-filter refinement + Clarity/Sharpen finish.
+    """Simple flow: MODNet -> guided filter -> studio finish -> composite -> sharpen.
 
     Returns (finished_rgb, alpha_uint8 or None). If matting is unavailable
     we degrade gracefully and only apply the Clarity/Sharpen finish on the
     untouched RGB image so the pipeline still produces output.
 
-    Crucially, we composite using RVM's `fgr` output (color-decontaminated
-    foreground) rather than the original RGB. At semi-transparent hair
-    pixels RVM has already subtracted off the background's color
-    contribution — so `fgr * pha` produces cleaner hair strands on black
-    than `original_rgb * pha` does, with no extra inference work.
+    Pipeline stages:
+      1. MODNet            -> raw alpha matte at source resolution
+      2. Guided filter     -> alpha snaps to real image edges (radius=6)
+      3. Studio finish     -> Adobe-Express style alpha cleanup (morph,
+                              smoothstep, sub-pixel feather)
+      4. Composite-on-black-> RGB * alpha for a pure-black background
+      5. Clarity + UnsharpMask for pore-level skin sharpness
     """
-    matting = run_matting(img_rgb)
-    if matting is None:
+    alpha = run_matting(img_rgb)
+    if alpha is None:
         return _clarity_and_sharpen(img_rgb), None
 
-    fgr, alpha = matting
-
-    # Refine the upsampled matte against the source luma so the alpha
-    # snaps to real image edges. Use the original RGB (not fgr) as the
-    # guide because hair strands are most visible against the actual
-    # background luminance.
     rgb_arr = np.array(img_rgb.convert("RGB"))
     gray = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
-    alpha = _guided_filter_alpha(gray, alpha, radius=4, eps=1e-3)
+    alpha = _guided_filter_alpha(gray, alpha, radius=6, eps=1e-3)
+    alpha = _studio_finish_alpha(alpha)
 
-    on_black = _composite_on_black(fgr, alpha)
+    on_black = _composite_on_black(rgb_arr, alpha)
     finished = _clarity_and_sharpen(on_black)
     return finished, alpha
 
@@ -291,88 +281,12 @@ def normalize_portrait(img: Image.Image) -> Image.Image:
 
 
 def fixed_analysis_crop(img: Image.Image) -> Image.Image:
-    """Fallback when face detection is unavailable: dead-center 1000x1000."""
+    """Dead-center 1000x1000 ROI on the normalized portrait — the May-4
+    simple flow. Stable across captures because the portrait normalize
+    step has already centered the subject in the 2160x2700 frame."""
     left = (img.width - ANALYSIS_CROP_SIZE) // 2
     top = (img.height - ANALYSIS_CROP_SIZE) // 2
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
-
-
-# ---------------------------------------------------------------------------
-# Matte-aware analysis crop (anchors the ROI to foreground, not just the frame)
-# ---------------------------------------------------------------------------
-# A fixed center crop is sensitive to small head-position shifts: the cheek can
-# drift out of the 1000x1000 ROI and hair/background can drift in. We avoid a
-# new face-detection dependency here and use the RVM alpha matte we already
-# computed. This keeps the deployment simple while still anchoring the crop to
-# the subject.
-
-
-def _alpha_anchor_center(alpha: np.ndarray | None) -> tuple[int, int] | None:
-    """Estimate a stable face/upper-head center from the foreground matte.
-
-    The full alpha mask includes shoulders, so using the whole foreground bbox
-    would pull the crop too low. Instead we use the upper 55% of the foreground
-    bbox and take the median foreground coordinate there. For right-profile
-    captures this lands the crop on the head/cheek region without adding any
-    model or runtime dependency.
-    """
-    if alpha is None:
-        return None
-
-    mask = alpha > 128
-    if not np.any(mask):
-        return None
-
-    ys, xs = np.where(mask)
-    y_min = int(ys.min())
-    y_max = int(ys.max())
-    upper_limit = y_min + max(1, int((y_max - y_min) * 0.55))
-    upper_mask = mask.copy()
-    upper_mask[upper_limit:, :] = False
-
-    if not np.any(upper_mask):
-        return None
-
-    upper_ys, upper_xs = np.where(upper_mask)
-    return int(np.median(upper_xs)), int(np.median(upper_ys))
-
-
-def compute_analysis_crop_box(
-    portrait: Image.Image, alpha: np.ndarray | None
-) -> tuple[tuple[int, int, int, int], float, str]:
-    """Decide the 1000x1000 analysis crop coordinates for this portrait.
-
-    Returns (box, alpha_coverage, anchor_source):
-      box: (left, top, right, bottom) clamped inside the portrait
-      alpha_coverage: fraction of the box covered by alpha > 128 (face
-        framing quality metric). 1.0 when alpha is None.
-      anchor_source: "alpha" when the RVM matte gave us an anchor; "center"
-        when we fell back to the original fixed-center crop.
-
-    The box is always clamped so it never extends past the portrait edges,
-    which means callers can crop directly without a bounds check.
-    """
-    w, h = portrait.size
-    half = ANALYSIS_CROP_SIZE // 2
-
-    center = _alpha_anchor_center(alpha)
-    anchor_source = "alpha" if center is not None else "center"
-    if center is None:
-        center = (w // 2, h // 2)
-
-    cx, cy = center
-    left = max(0, min(w - ANALYSIS_CROP_SIZE, cx - half))
-    top = max(0, min(h - ANALYSIS_CROP_SIZE, cy - half))
-    box = (left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE)
-
-    coverage = 1.0
-    if alpha is not None:
-        alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
-        coverage = float((alpha_crop > 128).sum()) / float(
-            ANALYSIS_CROP_SIZE * ANALYSIS_CROP_SIZE
-        )
-
-    return box, coverage, anchor_source
 
 
 def jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
@@ -476,8 +390,8 @@ def skin_mask(rgb: np.ndarray) -> np.ndarray:
 
 
 def _face_mask(rgb: np.ndarray, alpha_crop: np.ndarray | None) -> np.ndarray:
-    """Combine brightness gating with the RVM alpha matte so scoring only
-    sees actual face pixels — no background, no hair edge."""
+    """Combine brightness gating with the MODNet alpha matte so scoring
+    only sees actual face pixels — no background, no hair edge."""
     mask = skin_mask(rgb)
     if alpha_crop is not None:
         # alpha > 200 -> definite foreground (avoids matte halo pixels).
@@ -600,18 +514,12 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label == ANALYSIS_ANGLE:
-        # Crop box and framing coverage were pre-computed in Phase 1 before
-        # this parallel encode/upload stage.
-        crop_box: tuple[int, int, int, int] = prepared["analysis_crop_box"]
-        framing_coverage: float = prepared["analysis_framing_coverage"]
-        crop_anchor: str = prepared["analysis_crop_anchor"]
-        left, top, right, bottom = crop_box
-
-        crop = clean.crop(crop_box)
+        crop = fixed_analysis_crop(clean)
+        left = (clean.width - ANALYSIS_CROP_SIZE) // 2
+        top = (clean.height - ANALYSIS_CROP_SIZE) // 2
         alpha_crop = None
         if alpha is not None:
-            alpha_crop = alpha[top:bottom, left:right]
-
+            alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
         crop_url = upload_webp_lossless(crop, f"right90_crop_{uid}.webp")
         angle_data.update(
             {
@@ -622,20 +530,11 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
                     "width": ANALYSIS_CROP_SIZE,
                     "height": ANALYSIS_CROP_SIZE,
                 },
-                "crop_anchor": crop_anchor,
-                "alpha_anchored": crop_anchor == "alpha",
-                "framing_coverage": round(framing_coverage, 3),
                 "redness_score": compute_redness_score(crop, alpha_crop),
                 "white_score": compute_white_score(crop, alpha_crop),
                 **compute_quality(crop),
             }
         )
-        # Surface a soft warning if the ROI overlaps the face poorly —
-        # the app can prompt for a retake without us rejecting the scan.
-        if framing_coverage < 0.45:
-            angle_data.setdefault("quality_warnings", []).append(
-                "Right_90 framing low: face does not fill the analysis ROI."
-            )
 
     print(
         f"[handler] {label} OK"
@@ -648,10 +547,10 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
     """Two-phase pipeline:
 
     Phase 1 (sequential): per angle — download original, normalize to the
-        portrait frame, run RVM matting + guided-filter refine + Clarity
-        / UnsharpMask finish. RVM on CPU already saturates all cores via
-        ORT's intra-op pool; running multiple inferences concurrently would
-        thrash, so we serialize this phase.
+        portrait frame, run MODNet matting + guided-filter refine + studio
+        finish + Clarity/UnsharpMask. MODNet on CPU already saturates all
+        cores via ORT's intra-op pool; running multiple inferences
+        concurrently would thrash, so we serialize this phase.
 
     Phase 2 (parallel): build the false-color visia map, encode WebP/JPEG,
         and upload to Supabase Storage. All of these release the GIL during
@@ -666,31 +565,17 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
             continue
         portrait = normalize_portrait(original)
         clean, alpha = remove_background_and_finish(portrait)
-
-        item: dict = {
-            "label": label,
-            "original_url": original_url,
-            "clean": clean,
-            "alpha": alpha,
-        }
-
-        # Matte-anchored analysis crop only matters for right_90; the other
-        # angles are display-only and don't need ROI math.
-        if label == ANALYSIS_ANGLE:
-            crop_box, coverage, crop_anchor = compute_analysis_crop_box(clean, alpha)
-            item["analysis_crop_box"] = crop_box
-            item["analysis_framing_coverage"] = coverage
-            item["analysis_crop_anchor"] = crop_anchor
-            print(
-                f"[handler] {label} crop "
-                f"box={crop_box} cov={coverage:.2f} "
-                f"{crop_anchor}-anchored"
-            )
-
-        prepared_angles.append(item)
+        prepared_angles.append(
+            {
+                "label": label,
+                "original_url": original_url,
+                "clean": clean,
+                "alpha": alpha,
+            }
+        )
         print(
             f"[handler] {label} matting "
-            + ("OK" if alpha is not None else "SKIPPED (no RVM model)")
+            + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
         )
 
     processed: dict = {}
