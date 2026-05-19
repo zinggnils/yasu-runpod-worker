@@ -298,72 +298,56 @@ def fixed_analysis_crop(img: Image.Image) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Face-aware analysis crop (anchors the ROI to the actual face, not the frame)
+# Matte-aware analysis crop (anchors the ROI to foreground, not just the frame)
 # ---------------------------------------------------------------------------
-# A fixed center crop was a constant source of variance for the right_90
-# metrics — a few cm of head shift would push the cheek partly outside the
-# ROI and pull hair / background in. Anchoring to the detected face bbox
-# eliminates that variance: the same skin pixels land in the ROI on every
-# capture regardless of where the user framed their head.
-#
-# MediaPipe Face Detection model_selection=1 ("full range") handles distances
-# up to ~5m and is more robust to side-profile poses than model_selection=0.
-# We also drop min_detection_confidence to 0.3 so strict 90° profiles, which
-# the model is less confident on, still detect.
-try:
-    import mediapipe as mp  # type: ignore
-
-    FACE_DETECTOR = mp.solutions.face_detection.FaceDetection(
-        model_selection=1,
-        min_detection_confidence=0.3,
-    )
-    print(
-        f"[face] MediaPipe Face Detection initialized "
-        f"(model=full_range, conf=0.3, mp={mp.__version__})"
-    )
-except Exception as exc:  # noqa: BLE001
-    FACE_DETECTOR = None
-    print(f"[face] MediaPipe unavailable; analysis crop falls back to fixed center: {exc}")
+# A fixed center crop is sensitive to small head-position shifts: the cheek can
+# drift out of the 1000x1000 ROI and hair/background can drift in. We avoid a
+# new face-detection dependency here and use the RVM alpha matte we already
+# computed. This keeps the deployment simple while still anchoring the crop to
+# the subject.
 
 
-def _detect_face_center(portrait_rgb: Image.Image) -> tuple[int, int] | None:
-    """Return the pixel-space (cx, cy) of the detected face bbox center,
-    or None when no face is found / MediaPipe is unavailable."""
-    if FACE_DETECTOR is None:
+def _alpha_anchor_center(alpha: np.ndarray | None) -> tuple[int, int] | None:
+    """Estimate a stable face/upper-head center from the foreground matte.
+
+    The full alpha mask includes shoulders, so using the whole foreground bbox
+    would pull the crop too low. Instead we use the upper 55% of the foreground
+    bbox and take the median foreground coordinate there. For right-profile
+    captures this lands the crop on the head/cheek region without adding any
+    model or runtime dependency.
+    """
+    if alpha is None:
         return None
-    try:
-        rgb = np.array(portrait_rgb.convert("RGB"))
-        # MediaPipe expects RGB input; we already have RGB.
-        results = FACE_DETECTOR.process(rgb)
-        if not results.detections:
-            return None
-        # Pick the highest-score detection. For a single subject this is
-        # almost always the only one.
-        det = max(
-            results.detections,
-            key=lambda d: d.score[0] if d.score else 0.0,
-        )
-        bbox = det.location_data.relative_bounding_box
-        w, h = portrait_rgb.size
-        cx = int((bbox.xmin + bbox.width / 2.0) * w)
-        cy = int((bbox.ymin + bbox.height / 2.0) * h)
-        return cx, cy
-    except Exception as exc:  # noqa: BLE001
-        print(f"[face] detection error, falling back to center: {exc}")
+
+    mask = alpha > 128
+    if not np.any(mask):
         return None
+
+    ys, xs = np.where(mask)
+    y_min = int(ys.min())
+    y_max = int(ys.max())
+    upper_limit = y_min + max(1, int((y_max - y_min) * 0.55))
+    upper_mask = mask.copy()
+    upper_mask[upper_limit:, :] = False
+
+    if not np.any(upper_mask):
+        return None
+
+    upper_ys, upper_xs = np.where(upper_mask)
+    return int(np.median(upper_xs)), int(np.median(upper_ys))
 
 
 def compute_analysis_crop_box(
     portrait: Image.Image, alpha: np.ndarray | None
-) -> tuple[tuple[int, int, int, int], float, bool]:
+) -> tuple[tuple[int, int, int, int], float, str]:
     """Decide the 1000x1000 analysis crop coordinates for this portrait.
 
-    Returns (box, alpha_coverage, used_face_detection):
+    Returns (box, alpha_coverage, anchor_source):
       box: (left, top, right, bottom) clamped inside the portrait
       alpha_coverage: fraction of the box covered by alpha > 128 (face
         framing quality metric). 1.0 when alpha is None.
-      used_face_detection: True if MediaPipe gave us the anchor; False if
-        we fell back to fixed center.
+      anchor_source: "alpha" when the RVM matte gave us an anchor; "center"
+        when we fell back to the original fixed-center crop.
 
     The box is always clamped so it never extends past the portrait edges,
     which means callers can crop directly without a bounds check.
@@ -371,8 +355,8 @@ def compute_analysis_crop_box(
     w, h = portrait.size
     half = ANALYSIS_CROP_SIZE // 2
 
-    center = _detect_face_center(portrait)
-    used_face = center is not None
+    center = _alpha_anchor_center(alpha)
+    anchor_source = "alpha" if center is not None else "center"
     if center is None:
         center = (w // 2, h // 2)
 
@@ -388,7 +372,7 @@ def compute_analysis_crop_box(
             ANALYSIS_CROP_SIZE * ANALYSIS_CROP_SIZE
         )
 
-    return box, coverage, used_face
+    return box, coverage, anchor_source
 
 
 def jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
@@ -616,11 +600,11 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label == ANALYSIS_ANGLE:
-        # Crop box and framing coverage were pre-computed in Phase 1 so
-        # MediaPipe inference doesn't race with the parallel encode pool.
+        # Crop box and framing coverage were pre-computed in Phase 1 before
+        # this parallel encode/upload stage.
         crop_box: tuple[int, int, int, int] = prepared["analysis_crop_box"]
         framing_coverage: float = prepared["analysis_framing_coverage"]
-        face_anchored: bool = prepared["analysis_face_anchored"]
+        crop_anchor: str = prepared["analysis_crop_anchor"]
         left, top, right, bottom = crop_box
 
         crop = clean.crop(crop_box)
@@ -638,7 +622,8 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
                     "width": ANALYSIS_CROP_SIZE,
                     "height": ANALYSIS_CROP_SIZE,
                 },
-                "face_anchored": face_anchored,
+                "crop_anchor": crop_anchor,
+                "alpha_anchored": crop_anchor == "alpha",
                 "framing_coverage": round(framing_coverage, 3),
                 "redness_score": compute_redness_score(crop, alpha_crop),
                 "white_score": compute_white_score(crop, alpha_crop),
@@ -689,19 +674,17 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
             "alpha": alpha,
         }
 
-        # Face-anchored analysis crop only matters for right_90; running
-        # MediaPipe on the other angles would just burn ~30 ms each for
-        # nothing. Doing it sequentially in Phase 1 also sidesteps
-        # MediaPipe's non-thread-safe `process()`.
+        # Matte-anchored analysis crop only matters for right_90; the other
+        # angles are display-only and don't need ROI math.
         if label == ANALYSIS_ANGLE:
-            crop_box, coverage, face_anchored = compute_analysis_crop_box(clean, alpha)
+            crop_box, coverage, crop_anchor = compute_analysis_crop_box(clean, alpha)
             item["analysis_crop_box"] = crop_box
             item["analysis_framing_coverage"] = coverage
-            item["analysis_face_anchored"] = face_anchored
+            item["analysis_crop_anchor"] = crop_anchor
             print(
                 f"[handler] {label} crop "
                 f"box={crop_box} cov={coverage:.2f} "
-                f"{'face-anchored' if face_anchored else 'center-fallback'}"
+                f"{crop_anchor}-anchored"
             )
 
         prepared_angles.append(item)
