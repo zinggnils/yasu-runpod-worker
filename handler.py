@@ -188,6 +188,189 @@ def _studio_finish_alpha(alpha: np.ndarray) -> np.ndarray:
     return alpha
 
 
+# ---------------------------------------------------------------------------
+# Editor refine pipeline (mode="refine")
+# ---------------------------------------------------------------------------
+# The initial scan optimizes for speed: MODNet at 512 px + a one-pass studio
+# finish on the alpha matte. The editor refine job has a 30-second user
+# budget and operates on the *already-processed* clean image. It does two
+# things the initial scan doesn't:
+#
+#   1. Edge halo cleanup — detect light pixels at hair edges that survived
+#      the first pass (color spill from the original background bleeding
+#      through soft-alpha regions) and push them toward black. This is what
+#      removes the "~0.1% white halo".
+#   2. Standardization — find the face with OpenCV Haar cascades, translate
+#      and scale the subject so the face lands at a canonical position on a
+#      2160x2700 black canvas. Same face size / framing on every refine, so
+#      cross-session comparisons line up.
+
+
+# Canonical placement targets used by `standardize_to_canonical`. Face
+# height = 45 % of frame height, face top = 20 % from frame top, face
+# horizontally centered. Picked to leave forehead room without crowding
+# the chin, matching the framing of a passport / studio portrait.
+STD_FACE_HEIGHT_FRAC = float(os.environ.get("STD_FACE_HEIGHT_FRAC", "0.45"))
+STD_FACE_TOP_FRAC = float(os.environ.get("STD_FACE_TOP_FRAC", "0.20"))
+
+
+def refine_studio_quality(img_rgb: Image.Image) -> Image.Image:
+    """Second-pass halo cleanup on an already-processed black-bg image.
+
+    The processed image is `original_rgb * alpha` composited onto pure
+    black. Hair edges with soft alpha + light source-background pixels
+    leave a faint "white halo" — we detect those edge-band pixels and
+    push them toward black without touching solid foreground.
+
+    Pure numpy/OpenCV — ~80-150 ms per 2160x2700 angle.
+    """
+    arr = np.array(img_rgb.convert("RGB")).astype(np.float32)
+
+    # 1. Re-estimate alpha from the displayed pixel value. Pure-black BG
+    #    means `displayed.max() == 0` there; non-zero pixels are foreground
+    #    weighted by the (lost) original alpha. We treat the max channel
+    #    intensity / 255 as a proxy for alpha.
+    alpha = arr.max(axis=2) / 255.0
+
+    bulk_fg = alpha > 0.65
+    if not np.any(bulk_fg):
+        return img_rgb  # nothing meaningful to refine
+
+    # 2. Find the median brightness of the bulk foreground. Edge pixels
+    #    that are *brighter* than this are almost certainly background
+    #    spill, not natural FG content.
+    hsv = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    v = hsv[..., 2]
+    fg_v_median = float(np.median(v[bulk_fg]))
+
+    # 3. Identify edge band — alpha 0.05–0.65, the transition zone.
+    edge_band = (alpha > 0.05) & (alpha < 0.65)
+    if np.any(edge_band):
+        too_bright = edge_band & (v > fg_v_median * 1.30)
+        if np.any(too_bright):
+            ratio = (fg_v_median / np.maximum(v, 1.0)).astype(np.float32)
+            # Cap ratio so we never *brighten* a pixel.
+            ratio = np.clip(ratio, 0.0, 1.0)
+            scale = np.where(too_bright, ratio, 1.0).astype(np.float32)
+            arr = arr * scale[..., None]
+
+    # 4. Tighten the silhouette: re-apply a smoothstep on alpha (using the
+    #    *refined* pixel intensities so any halo darkening propagates) and
+    #    re-multiply. This pushes the very low alpha values to zero (kills
+    #    any residual outer glow).
+    alpha_new = arr.max(axis=2) / 255.0
+    lo, hi = 0.05, 0.85
+    af = np.clip((alpha_new - lo) / (hi - lo), 0.0, 1.0)
+    af = af * af * (3.0 - 2.0 * af)
+    arr = arr * af[..., None]
+
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+
+
+# Haar cascades for face detection. Built into opencv-python-headless, so
+# no extra Docker layer needed. Frontal cascade is more accurate but only
+# works on near-frontal poses; the profile cascade handles the 90° angles.
+try:
+    _HAAR_DIR = cv2.data.haarcascades
+    FACE_FRONTAL = cv2.CascadeClassifier(_HAAR_DIR + "haarcascade_frontalface_default.xml")
+    FACE_PROFILE = cv2.CascadeClassifier(_HAAR_DIR + "haarcascade_profileface.xml")
+    if FACE_FRONTAL.empty() or FACE_PROFILE.empty():
+        print("[face] WARNING: Haar cascades empty; standardization will pass through")
+        FACE_FRONTAL = FACE_PROFILE = None  # type: ignore
+    else:
+        print("[face] Haar cascades loaded (frontal + profile)")
+except Exception as exc:  # noqa: BLE001
+    FACE_FRONTAL = FACE_PROFILE = None  # type: ignore
+    print(f"[face] Haar cascade init failed: {exc}")
+
+
+def detect_face_bbox(
+    img_rgb: Image.Image, angle_label: str
+) -> tuple[int, int, int, int] | None:
+    """Return (x, y, w, h) of the largest detected face, or None.
+
+    For 90° profile angles we try the profile cascade first; for everything
+    else (frontal, 45°) we try the frontal cascade first. Either cascade
+    can serve as a fallback. The face is searched against the grayscale
+    version of the image.
+    """
+    if FACE_FRONTAL is None or FACE_PROFILE is None:
+        return None
+
+    gray = cv2.cvtColor(np.array(img_rgb.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    is_profile = "90" in angle_label
+    primary = FACE_PROFILE if is_profile else FACE_FRONTAL
+    fallback = FACE_FRONTAL if is_profile else FACE_PROFILE
+
+    for cascade in (primary, fallback):
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(150, 150),
+        )
+        if len(faces) > 0:
+            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+            return int(x), int(y), int(w), int(h)
+    return None
+
+
+def standardize_to_canonical(
+    img_rgb: Image.Image, face_bbox: tuple[int, int, int, int]
+) -> Image.Image:
+    """Translate + scale the cleaned subject onto a 2160x2700 black canvas
+    so the face lands at a canonical position. Same framing every refine.
+
+    Anchor: face is centered horizontally, face-top sits at
+    STD_FACE_TOP_FRAC of the frame, face height = STD_FACE_HEIGHT_FRAC of
+    the frame. We never crop the input image; if the scaled subject would
+    fall outside the canvas, the canvas just shows black there.
+    """
+    fx, fy, fw, fh = face_bbox
+    if fh <= 0:
+        return img_rgb
+
+    target_face_h = STD_FACE_HEIGHT_FRAC * PORTRAIT_HEIGHT
+    scale = target_face_h / float(fh)
+
+    new_w = max(1, int(round(img_rgb.width * scale)))
+    new_h = max(1, int(round(img_rgb.height * scale)))
+    scaled = img_rgb.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Where the face center should end up in the canvas.
+    target_face_cx = PORTRAIT_WIDTH / 2.0
+    target_face_top_y = STD_FACE_TOP_FRAC * PORTRAIT_HEIGHT
+    target_face_cy = target_face_top_y + target_face_h / 2.0
+
+    # Face center in the scaled image.
+    scaled_face_cx = (fx + fw / 2.0) * scale
+    scaled_face_cy = (fy + fh / 2.0) * scale
+
+    paste_x = int(round(target_face_cx - scaled_face_cx))
+    paste_y = int(round(target_face_cy - scaled_face_cy))
+
+    canvas = Image.new("RGB", (PORTRAIT_WIDTH, PORTRAIT_HEIGHT), (0, 0, 0))
+    canvas.paste(scaled, (paste_x, paste_y))
+    return canvas
+
+
+def _download_processed_url(url: str) -> Image.Image:
+    """Download a previously-uploaded processed image from Supabase Storage.
+
+    The bearer header works for both public and private buckets — public
+    buckets just ignore it. Returns an EXIF-corrected RGB image.
+    """
+    headers = {}
+    if SUPABASE_SERVICE_KEY:
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
+    resp = requests.get(url, headers=headers, timeout=90)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Refine download failed: {resp.status_code} {url[:120]}"
+        )
+    return ImageOps.exif_transpose(Image.open(BytesIO(resp.content))).convert("RGB")
+
+
 def _clarity_and_sharpen(img: Image.Image) -> Image.Image:
     """May-4 finish: subtle Clarity (large-radius high-pass) + UnsharpMask.
 
@@ -480,6 +663,90 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) ->
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
 
+def update_supabase_scan_studio(scan_id: str, studio_angles: dict) -> None:
+    """Write the editor-refine results back to the scan row.
+
+    We use a dedicated `studio_angles` JSON field plus a top-level
+    `studio_image_url` (mirroring how `processed_angles` + `clean_image_url`
+    work for the initial pass) so the app can render the editor view
+    without having to inspect a nested dict.
+    """
+    # NOTE: we deliberately do NOT touch `status` here — the initial scan
+    # already set it to "done" and the app polls that field. The refine
+    # job announces itself only through the new `studio_*` fields, which
+    # the app polls separately.
+    url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
+    right90 = studio_angles.get(ANALYSIS_ANGLE, {})
+    body = {
+        "studio_angles": studio_angles,
+        "studio_image_url": right90.get("studio_image_url"),
+    }
+    resp = requests.patch(
+        url,
+        json=body,
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        timeout=60,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Studio DB update failed: {resp.status_code} {resp.text[:200]}")
+
+
+def _refine_one_angle(label: str, source_url: str, uid: str) -> tuple[str, dict]:
+    """Download a previously-processed clean image, run halo cleanup +
+    canonical face placement, upload the result. Returns (label, dict)."""
+    if not source_url:
+        return label, {"studio_image_url": None, "error": "missing source url"}
+
+    img = _download_processed_url(source_url)
+    cleaned = refine_studio_quality(img)
+
+    bbox = detect_face_bbox(cleaned, label)
+    if bbox is None:
+        # No face found -> skip canonical transform, but still ship the
+        # halo-cleaned image so the editor view at least shows the
+        # improved edges.
+        standardized = cleaned
+        framing = "passthrough"
+    else:
+        standardized = standardize_to_canonical(cleaned, bbox)
+        framing = f"face@{bbox}"
+
+    studio_url = upload_webp_lossless(standardized, f"studio_{label}_{uid}.webp")
+    print(f"[refine] {label} OK framing={framing}")
+    return label, {
+        "studio_image_url": studio_url,
+        "source_clean_url": source_url,
+        "face_bbox": list(bbox) if bbox is not None else None,
+    }
+
+
+def process_refine(scan_id: str, clean_urls: dict) -> dict:
+    """Editor refine entry point: edge halo cleanup + canonical placement.
+
+    `clean_urls` is `{angle_label: clean_image_url}` from the initial scan.
+    All per-angle work is independent and dominated by HTTP I/O, so we run
+    it through a thread pool — same pattern as the initial Phase 2.
+    """
+    if not clean_urls:
+        return {}
+
+    uid = uuid.uuid4().hex[:10]
+    items = [(label, url) for label, url in clean_urls.items() if url]
+
+    studio: dict = {}
+    with ThreadPoolExecutor(max_workers=min(len(items), 5)) as pool:
+        futures = [pool.submit(_refine_one_angle, label, url, uid) for label, url in items]
+        for fut in futures:
+            label, data = fut.result()
+            studio[label] = data
+    return studio
+
+
 def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     """I/O- and CPU-bound work that runs in parallel across angles.
 
@@ -594,11 +861,40 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
 def handler(job):
     job_input = job.get("input", {})
     scan_id = job_input.get("scan_id")
-    images = job_input.get("images") or {}
-    image_paths = job_input.get("image_paths") or {}
     mode = job_input.get("mode", "redness")
 
-    print(f"[handler] scan_id={scan_id} image_paths={list(image_paths.keys())} images={list(images.keys())}")
+    # ---- Editor refine mode -------------------------------------------------
+    # Triggered by the "Open in Editor" button. Takes the already-processed
+    # clean_image_urls from the initial scan and runs studio-grade halo
+    # cleanup + canonical face placement on each angle.
+    if mode == "refine":
+        clean_urls = job_input.get("clean_image_urls") or {}
+        if not scan_id or not clean_urls:
+            return {"error": "refine mode requires scan_id and clean_image_urls"}
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+
+        print(
+            f"[handler] mode=refine scan_id={scan_id} "
+            f"angles={list(clean_urls.keys())}"
+        )
+        studio_angles = process_refine(scan_id, clean_urls)
+        update_supabase_scan_studio(scan_id, studio_angles)
+        print(f"[handler] refine DB updated OK for scan_id={scan_id}")
+        return {
+            "status": "studio_done",
+            "scan_id": scan_id,
+            "studio_angles": studio_angles,
+        }
+
+    # ---- Initial scan mode (default) ---------------------------------------
+    images = job_input.get("images") or {}
+    image_paths = job_input.get("image_paths") or {}
+
+    print(
+        f"[handler] mode={mode} scan_id={scan_id} "
+        f"image_paths={list(image_paths.keys())} images={list(images.keys())}"
+    )
 
     if not isinstance(images, dict) or not isinstance(image_paths, dict):
         return {"error": "input.images and input.image_paths must be objects keyed by angle"}
