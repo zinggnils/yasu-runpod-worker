@@ -1,6 +1,7 @@
 import base64
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import cv2
@@ -88,13 +89,10 @@ def jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
 
 
 def webp_lossless_bytes(img: Image.Image) -> bytes:
-    """Encode image as bit-exact lossless WebP.
+    """Encode image as bit-exact lossless WebP (analysis-grade).
 
-    Pillow exposes libwebp's lossless mode explicitly: `lossless=True` keeps
-    every pixel intact, `quality` only controls compression effort in this mode
-    (0=fastest, 100=smallest), `method=6` picks the strongest entropy coder.
-    Compared to PNG, lossless WebP is typically 25-35% smaller at identical
-    fidelity, which directly reduces Supabase storage + egress per scan.
+    Reserved for the right_90 ROI artifacts where pixel-exact fidelity matters
+    for re-analysis. method=6 is the strongest (slowest) entropy coder.
     """
     buf = BytesIO()
     img.convert("RGB").save(
@@ -103,6 +101,23 @@ def webp_lossless_bytes(img: Image.Image) -> bytes:
         lossless=True,
         quality=100,
         method=6,
+    )
+    return buf.getvalue()
+
+
+def webp_visual_bytes(img: Image.Image, quality: int = 95) -> bytes:
+    """Encode image as high-quality lossy WebP for display use.
+
+    For the four non-analysis angles we only render them; we never re-run
+    skin math on them. q=95 method=4 is visually indistinguishable from
+    lossless on skin imagery and encodes ~5-10x faster than lossless.
+    """
+    buf = BytesIO()
+    img.convert("RGB").save(
+        buf,
+        format="WEBP",
+        quality=quality,
+        method=4,
     )
     return buf.getvalue()
 
@@ -131,6 +146,10 @@ def upload_jpeg(img: Image.Image, filename: str, quality: int = 95) -> str:
 
 def upload_webp_lossless(img: Image.Image, filename: str) -> str:
     return upload_bytes(webp_lossless_bytes(img), filename, "image/webp")
+
+
+def upload_webp_visual(img: Image.Image, filename: str, quality: int = 95) -> str:
+    return upload_bytes(webp_visual_bytes(img, quality=quality), filename, "image/webp")
 
 
 def make_analysis_map(img: Image.Image, mode: str = "redness") -> Image.Image:
@@ -234,44 +253,65 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) ->
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
 
-def process_images(images: dict, image_paths: dict, mode: str = "redness") -> dict:
-    processed = {}
-    uid = uuid.uuid4().hex[:10]
+def _process_angle(label: str, images: dict, image_paths: dict, mode: str, uid: str) -> tuple[str, dict] | None:
+    """Process one angle. Designed to be safe to run in a worker thread:
+    Pillow image encoding releases the GIL during native libwebp calls, so
+    concurrent encodes of multiple angles overlap on multi-core CPUs.
+    """
+    original, original_url = load_angle_image(images, image_paths, label)
+    if original is None:
+        return None
 
-    for label in ANGLE_KEYS:
-        original, original_url = load_angle_image(images, image_paths, label)
-        if original is None:
-            continue
+    clean = normalize_portrait(original)
+    visia = make_analysis_map(clean, mode)
 
-        clean = normalize_portrait(original)
-        visia = make_analysis_map(clean, mode)
-        # Clean copy is the analysis-grade artifact: bit-exact lossless WebP so
-        # downstream analysis or re-processing never sees JPEG DCT artifacts.
+    if label == ANALYSIS_ANGLE:
+        # Analysis-grade: lossless WebP for both the full clean frame and the
+        # ROI crop, so re-analysis from storage is bit-exact.
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
-        # Visia is a derived false-color visualization; lossless serves no purpose here.
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
-        angle_data = {
-            "original_image_url": original_url,
-            "clean_image_url": clean_url,
-            "visia_image_url": visia_url,
-        }
+    else:
+        # Display-only angles: q=95 WebP is visually indistinguishable and
+        # ~5-10x faster to encode than lossless method=6.
+        clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
 
-        if label == ANALYSIS_ANGLE:
-            crop = fixed_analysis_crop(clean)
-            # right_90 crop is the actual ROI fed into redness / whiteness math
-            # if ever re-analyzed from storage. Keep it lossless.
-            crop_url = upload_webp_lossless(crop, f"right90_crop_{uid}.webp")
-            angle_data.update(
-                {
-                    "crop_image_url": crop_url,
-                    "crop_box": {"x": 580, "y": 850, "width": ANALYSIS_CROP_SIZE, "height": ANALYSIS_CROP_SIZE},
-                    "redness_score": compute_redness_score(crop),
-                    "white_score": compute_white_score(crop),
-                    **compute_quality(crop),
-                }
-            )
+    visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
 
-        processed[label] = angle_data
+    angle_data: dict = {
+        "original_image_url": original_url,
+        "clean_image_url": clean_url,
+        "visia_image_url": visia_url,
+    }
+
+    if label == ANALYSIS_ANGLE:
+        crop = fixed_analysis_crop(clean)
+        crop_url = upload_webp_lossless(crop, f"right90_crop_{uid}.webp")
+        angle_data.update(
+            {
+                "crop_image_url": crop_url,
+                "crop_box": {"x": 580, "y": 850, "width": ANALYSIS_CROP_SIZE, "height": ANALYSIS_CROP_SIZE},
+                "redness_score": compute_redness_score(crop),
+                "white_score": compute_white_score(crop),
+                **compute_quality(crop),
+            }
+        )
+
+    return label, angle_data
+
+
+def process_images(images: dict, image_paths: dict, mode: str = "redness") -> dict:
+    uid = uuid.uuid4().hex[:10]
+    processed: dict = {}
+
+    # Process all 5 angles in parallel. Each angle does: download -> normalize
+    # -> encode WebP/JPEG -> upload. Pillow + requests release the GIL during
+    # native calls, so we get real parallelism on storage I/O and libwebp.
+    with ThreadPoolExecutor(max_workers=len(ANGLE_KEYS)) as pool:
+        futures = [pool.submit(_process_angle, label, images, image_paths, mode, uid) for label in ANGLE_KEYS]
+        for fut in futures:
+            result = fut.result()
+            if result is not None:
+                label, data = result
+                processed[label] = data
 
     return processed
 
