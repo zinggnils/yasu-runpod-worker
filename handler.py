@@ -287,6 +287,29 @@ except Exception as exc:  # noqa: BLE001
     print(f"[face] Haar cascade init failed: {exc}")
 
 
+def detect_face_bbox_fast(
+    img_rgb: Image.Image, angle_label: str
+) -> tuple[int, int, int, int] | None:
+    """Haar on a downscaled frame — same bbox logic, ~4× faster on 2160px portraits."""
+    w, h = img_rgb.size
+    target = 1080
+    if max(w, h) > target:
+        scale = target / float(max(w, h))
+        sw, sh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        small = img_rgb.resize((sw, sh), Image.Resampling.BILINEAR)
+        bbox = detect_face_bbox(small, angle_label)
+        if bbox is not None:
+            x, y, bw, bh = bbox
+            inv = 1.0 / scale
+            return (
+                int(round(x * inv)),
+                int(round(y * inv)),
+                max(1, int(round(bw * inv))),
+                max(1, int(round(bh * inv))),
+            )
+    return detect_face_bbox(img_rgb, angle_label)
+
+
 def detect_face_bbox(
     img_rgb: Image.Image, angle_label: str
 ) -> tuple[int, int, int, int] | None:
@@ -467,12 +490,103 @@ def normalize_portrait(img: Image.Image) -> Image.Image:
 
 
 def fixed_analysis_crop(img: Image.Image) -> Image.Image:
-    """Dead-center 1000x1000 ROI on the normalized portrait — the May-4
-    simple flow. Stable across captures because the portrait normalize
-    step has already centered the subject in the 2160x2700 frame."""
+    """Dead-center 1000x1000 ROI — fallback when face detection fails."""
     left = (img.width - ANALYSIS_CROP_SIZE) // 2
     top = (img.height - ANALYSIS_CROP_SIZE) // 2
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
+
+
+# Fractions of the Haar face box that cover the visible cheek (upper-mid profile).
+_CHEEK_FRAC: dict[str, tuple[float, float, float, float]] = {
+    # left_45: patient's left cheek toward camera → left + upper-mid of face box
+    "left_45": (0.0, 0.32, 0.58, 0.74),
+    # right_90: right profile → cheek bulge on the right + upper-mid of face box
+    "right_90": (0.36, 0.30, 1.0, 0.76),
+}
+
+
+def _clamp_box(l: int, t: int, r: int, b: int, w: int, h: int) -> tuple[int, int, int, int]:
+    l = max(0, min(l, w - 1))
+    t = max(0, min(t, h - 1))
+    r = max(l + 1, min(r, w))
+    b = max(t + 1, min(b, h))
+    return l, t, r, b
+
+
+def cheek_box_from_face(
+    face_bbox: tuple[int, int, int, int], label: str, img_w: int, img_h: int
+) -> tuple[int, int, int, int]:
+    """Pixel box (l, t, r, b) for the visible cheek inside the face bbox."""
+    fx, fy, fw, fh = face_bbox
+    lf, tf, rf, bf = _CHEEK_FRAC.get(label, (0.2, 0.3, 0.8, 0.75))
+    l = fx + int(fw * lf)
+    r = fx + int(fw * rf)
+    t = fy + int(fh * tf)
+    b = fy + int(fh * bf)
+    l, t, r, b = _clamp_box(l, t, r, b, img_w, img_h)
+
+    # Square region centered on cheek so scoring stays stable (same output size).
+    cx = (l + r) // 2
+    cy = (t + b) // 2
+    side = max(r - l, b - t, int(min(img_w, img_h) * 0.18))
+    half = side // 2
+    l, t, r, b = _clamp_box(cx - half, cy - half, cx + half, cy + half, img_w, img_h)
+    return l, t, r, b
+
+
+def analysis_roi_crop(
+    img: Image.Image, alpha: np.ndarray | None, label: str
+) -> tuple[Image.Image, np.ndarray | None, dict]:
+    """Cheek-focused 1000×1000 ROI for redness scoring (fast Haar, no landmarks)."""
+    w, h = img.size
+    bbox = detect_face_bbox_fast(img, label)
+    if bbox is not None:
+        l, t, r, b = cheek_box_from_face(bbox, label, w, h)
+        cheek = img.crop((l, t, r, b))
+        crop = ImageOps.fit(
+            cheek,
+            (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE),
+            method=Image.Resampling.BILINEAR,
+            centering=(0.5, 0.5),
+        )
+        alpha_crop = None
+        if alpha is not None:
+            patch = alpha[t:b, l:r]
+            alpha_crop = np.array(
+                Image.fromarray(patch).resize(
+                    (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE),
+                    Image.Resampling.BILINEAR,
+                )
+            )
+        return (
+            crop,
+            alpha_crop,
+            {
+                "x": l,
+                "y": t,
+                "width": r - l,
+                "height": b - t,
+                "method": "cheek_bbox",
+            },
+        )
+
+    crop = fixed_analysis_crop(img)
+    left = (w - ANALYSIS_CROP_SIZE) // 2
+    top = (h - ANALYSIS_CROP_SIZE) // 2
+    alpha_crop = None
+    if alpha is not None:
+        alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
+    return (
+        crop,
+        alpha_crop,
+        {
+            "x": left,
+            "y": top,
+            "width": ANALYSIS_CROP_SIZE,
+            "height": ANALYSIS_CROP_SIZE,
+            "method": "center_fallback",
+        },
+    )
 
 
 def jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
@@ -939,22 +1053,12 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        crop = fixed_analysis_crop(clean)
-        left = (clean.width - ANALYSIS_CROP_SIZE) // 2
-        top = (clean.height - ANALYSIS_CROP_SIZE) // 2
-        alpha_crop = None
-        if alpha is not None:
-            alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
+        crop, alpha_crop, crop_box = analysis_roi_crop(clean, alpha, label)
         crop_url = upload_webp_lossless(crop, f"{label}_crop_{uid}.webp")
         angle_data.update(
             {
                 "crop_image_url": crop_url,
-                "crop_box": {
-                    "x": left,
-                    "y": top,
-                    "width": ANALYSIS_CROP_SIZE,
-                    "height": ANALYSIS_CROP_SIZE,
-                },
+                "crop_box": crop_box,
                 "redness_score": compute_redness_score(crop, alpha_crop),
                 "white_score": compute_white_score(crop, alpha_crop),
                 **compute_quality(crop, label),
