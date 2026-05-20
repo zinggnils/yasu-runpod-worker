@@ -1,6 +1,7 @@
 import base64
 import os
 import uuid
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -712,36 +713,80 @@ def update_supabase_scan_studio(scan_id: str, studio_angles: dict) -> None:
         raise RuntimeError(f"Studio DB update failed: {resp.status_code} {resp.text[:200]}")
 
 
-def _refine_one_angle(label: str, source_url: str, uid: str) -> tuple[str, dict]:
-    """Download a previously-processed clean image, run halo cleanup +
-    canonical face placement, upload the result. Returns (label, dict)."""
+def _refine_one_angle(
+    label: str, source_url: str, uid: str, *, halo_only: bool = True
+) -> tuple[str, dict]:
+    """Download a processed clean image and run editor refine.
+
+    `halo_only=True` (default): edge halo cleanup only — no auto zoom or
+    canonical re-framing; the clinician nudges position manually in the app.
+    """
     if not source_url:
         return label, {"studio_image_url": None, "error": "missing source url"}
 
     img = _download_processed_url(source_url)
     cleaned = refine_studio_quality(img)
 
-    bbox = detect_face_bbox(cleaned, label)
-    if bbox is None:
-        # No face found -> skip canonical transform, but still ship the
-        # halo-cleaned image so the editor view at least shows the
-        # improved edges.
-        standardized = cleaned
-        framing = "passthrough"
+    if halo_only:
+        out = cleaned
+        framing = "halo_only"
     else:
-        standardized = standardize_to_canonical(cleaned, bbox)
-        framing = f"face@{bbox}"
+        bbox = detect_face_bbox(cleaned, label)
+        if bbox is None:
+            out = cleaned
+            framing = "passthrough"
+        else:
+            out = standardize_to_canonical(cleaned, bbox)
+            framing = f"face@{bbox}"
 
-    studio_url = upload_webp_lossless(standardized, f"studio_{label}_{uid}.webp")
+    studio_url = upload_webp_lossless(out, f"studio_{label}_{uid}.webp")
     print(f"[refine] {label} OK framing={framing}")
     return label, {
         "studio_image_url": studio_url,
         "source_clean_url": source_url,
-        "face_bbox": list(bbox) if bbox is not None else None,
+        "framing": framing,
     }
 
 
-def process_refine(scan_id: str, clean_urls: dict) -> dict:
+def apply_horizontal_shift(img_rgb: Image.Image, offset_x: int) -> Image.Image:
+    """Shift subject left/right on the same canvas (black background)."""
+    w, h = img_rgb.size
+    arr = np.array(img_rgb.convert("RGB"))
+    out = np.zeros_like(arr)
+    if offset_x >= 0:
+        if offset_x < w:
+            out[:, offset_x:] = arr[:, : w - offset_x]
+    else:
+        shift = -offset_x
+        if shift < w:
+            out[:, : w - shift] = arr[:, shift:]
+    return Image.fromarray(out, mode="RGB")
+
+
+def commit_refined_angle(
+    scan_id: str,
+    label: str,
+    refined_url: str,
+    offset_x: int,
+    processed_angles: dict,
+) -> dict:
+    """Bake manual offset into the refined image and replace processed_angles[label]."""
+    img = _download_processed_url(refined_url)
+    shifted = apply_horizontal_shift(img, int(offset_x))
+    uid = uuid.uuid4().hex[:10]
+    if label in ANALYSIS_ANGLES:
+        clean_url = upload_webp_lossless(shifted, f"clean_{label}_{uid}.webp")
+    else:
+        clean_url = upload_webp_visual(shifted, f"clean_{label}_{uid}.webp", quality=95)
+
+    prev = dict(processed_angles.get(label) or {})
+    prev["clean_image_url"] = clean_url
+    prev["refined_at"] = datetime.now(timezone.utc).isoformat()
+    prev["refine_offset_x"] = int(offset_x)
+    return prev
+
+
+def process_refine(scan_id: str, clean_urls: dict, *, halo_only: bool = True) -> dict:
     """Editor refine entry point: edge halo cleanup + canonical placement.
 
     `clean_urls` is `{angle_label: clean_image_url}` from the initial scan.
@@ -756,11 +801,81 @@ def process_refine(scan_id: str, clean_urls: dict) -> dict:
 
     studio: dict = {}
     with ThreadPoolExecutor(max_workers=min(len(items), 5)) as pool:
-        futures = [pool.submit(_refine_one_angle, label, url, uid) for label, url in items]
+        futures = [
+            pool.submit(_refine_one_angle, label, url, uid, halo_only=halo_only)
+            for label, url in items
+        ]
         for fut in futures:
             label, data = fut.result()
             studio[label] = data
     return studio
+
+
+def merge_supabase_scan_studio(scan_id: str, studio_patch: dict) -> None:
+    """Merge per-angle studio output without wiping other angles."""
+    url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}&select=studio_angles"
+    resp = requests.get(
+        url,
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "apikey": SUPABASE_SERVICE_KEY,
+        },
+        timeout=30,
+    )
+    existing: dict = {}
+    if resp.status_code == 200:
+        rows = resp.json()
+        if rows:
+            existing = dict(rows[0].get("studio_angles") or {})
+    existing.update(studio_patch)
+    right90 = existing.get(PRIMARY_ANALYSIS_ANGLE, {})
+    body = {
+        "studio_angles": existing,
+        "studio_image_url": right90.get("studio_image_url"),
+    }
+    patch = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}",
+        json=body,
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        timeout=60,
+    )
+    if patch.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Studio merge failed: {patch.status_code} {patch.text[:200]}")
+
+
+def update_supabase_processed_angle(
+    scan_id: str, label: str, angle_data: dict, processed_angles: dict
+) -> None:
+    """Replace one angle in processed_angles after manual refine save."""
+    merged = dict(processed_angles)
+    merged[label] = angle_data
+    primary = merged.get(PRIMARY_ANALYSIS_ANGLE, {})
+    redness_severity = average_analysis_redness(merged)
+    body = {
+        "processed_angles": merged,
+        "clean_image_url": primary.get("crop_image_url") or primary.get("clean_image_url"),
+        "redness_severity": redness_severity,
+        "studio_angles": None,
+        "studio_image_url": None,
+    }
+    resp = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}",
+        json=body,
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        timeout=60,
+    )
+    if resp.status_code not in (200, 201, 204):
+        raise RuntimeError(f"Processed angle update failed: {resp.status_code} {resp.text[:200]}")
 
 
 def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
@@ -890,17 +1005,43 @@ def handler(job):
         if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
             raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
+        halo_only = job_input.get("halo_only", True)
+        merge_studio = job_input.get("merge_studio", True)
         print(
             f"[handler] mode=refine scan_id={scan_id} "
-            f"angles={list(clean_urls.keys())}"
+            f"angles={list(clean_urls.keys())} halo_only={halo_only}"
         )
-        studio_angles = process_refine(scan_id, clean_urls)
-        update_supabase_scan_studio(scan_id, studio_angles)
+        studio_angles = process_refine(scan_id, clean_urls, halo_only=halo_only)
+        if merge_studio:
+            merge_supabase_scan_studio(scan_id, studio_angles)
+        else:
+            update_supabase_scan_studio(scan_id, studio_angles)
         print(f"[handler] refine DB updated OK for scan_id={scan_id}")
         return {
             "status": "studio_done",
             "scan_id": scan_id,
             "studio_angles": studio_angles,
+        }
+
+    if mode == "commit_refine":
+        label = job_input.get("angle")
+        refined_url = job_input.get("refined_url")
+        offset_x = int(job_input.get("offset_x") or 0)
+        processed_angles = job_input.get("processed_angles") or {}
+        if not scan_id or not label or not refined_url:
+            return {"error": "commit_refine requires scan_id, angle, refined_url"}
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+        angle_data = commit_refined_angle(
+            scan_id, label, refined_url, offset_x, processed_angles
+        )
+        update_supabase_processed_angle(scan_id, label, angle_data, processed_angles)
+        print(f"[handler] commit_refine OK scan_id={scan_id} angle={label}")
+        return {
+            "status": "committed",
+            "scan_id": scan_id,
+            "angle": label,
+            "clean_image_url": angle_data.get("clean_image_url"),
         }
 
     # ---- Initial scan mode (default) ---------------------------------------
