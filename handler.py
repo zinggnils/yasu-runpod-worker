@@ -29,7 +29,9 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "scans")
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-ANALYSIS_ANGLE = "right_90"
+# Angles that get the 1000×1000 ROI crop + redness scoring (avg drives scan severity).
+ANALYSIS_ANGLES = ("right_90", "left_45")
+PRIMARY_ANALYSIS_ANGLE = "right_90"
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
@@ -609,7 +611,7 @@ def compute_white_score(crop: Image.Image, alpha_crop: np.ndarray | None = None)
     return int(round(float(white.sum()) / float(mask.sum()) * 100))
 
 
-def compute_quality(crop: Image.Image) -> dict:
+def compute_quality(crop: Image.Image, label: str = "analysis") -> dict:
     gray = cv2.cvtColor(np.array(crop.convert("RGB")), cv2.COLOR_RGB2GRAY)
     blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     contrast = float(gray.std())
@@ -619,14 +621,27 @@ def compute_quality(crop: Image.Image) -> dict:
     quality = int(round(0.5 * exposure + 0.5 * contrast_score))
     warnings = []
     if blur < 80:
-        warnings.append("Right_90 crop may be blurry")
+        warnings.append(f"{label} crop may be blurry")
     if mean < 80:
-        warnings.append("Right_90 crop is underexposed")
+        warnings.append(f"{label} crop is underexposed")
     if mean > 190:
-        warnings.append("Right_90 crop is overexposed")
+        warnings.append(f"{label} crop is overexposed")
     if contrast < 25:
-        warnings.append("Right_90 crop has low contrast")
+        warnings.append(f"{label} crop has low contrast")
     return {"quality_score": quality, "quality_warnings": warnings}
+
+
+def average_analysis_redness(processed_angles: dict) -> int:
+    """Mean redness score across analysis angles present in this scan."""
+    scores: list[int] = []
+    for label in ANALYSIS_ANGLES:
+        data = processed_angles.get(label) or {}
+        raw = data.get("redness_score")
+        if raw is not None:
+            scores.append(int(raw))
+    if not scores:
+        return 0
+    return int(round(sum(scores) / len(scores)))
 
 
 def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image.Image | None, str | None]:
@@ -638,15 +653,16 @@ def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image
     return None, None
 
 
-def update_supabase_scan(scan_id: str, processed_angles: dict, right90: dict) -> None:
+def update_supabase_scan(scan_id: str, processed_angles: dict, primary: dict) -> None:
     url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
+    redness_severity = average_analysis_redness(processed_angles)
     body = {
         "status": "done",
         "processed_angles": processed_angles,
-        "clean_image_url": right90.get("crop_image_url") or right90.get("clean_image_url"),
-        "redness_image_url": right90.get("visia_image_url"),
-        "image_url": right90.get("visia_image_url"),
-        "redness_severity": right90.get("redness_score", 0),
+        "clean_image_url": primary.get("crop_image_url") or primary.get("clean_image_url"),
+        "redness_image_url": primary.get("visia_image_url"),
+        "image_url": primary.get("visia_image_url"),
+        "redness_severity": redness_severity,
     }
     resp = requests.patch(
         url,
@@ -676,7 +692,7 @@ def update_supabase_scan_studio(scan_id: str, studio_angles: dict) -> None:
     # job announces itself only through the new `studio_*` fields, which
     # the app polls separately.
     url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
-    right90 = studio_angles.get(ANALYSIS_ANGLE, {})
+    right90 = studio_angles.get(PRIMARY_ANALYSIS_ANGLE, {})
     body = {
         "studio_angles": studio_angles,
         "studio_image_url": right90.get("studio_image_url"),
@@ -762,7 +778,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
 
     visia = make_analysis_map(clean, mode, alpha=alpha)
 
-    if label == ANALYSIS_ANGLE:
+    if label in ANALYSIS_ANGLES:
         # Analysis-grade: bit-exact lossless WebP for the full clean frame
         # and the ROI crop, so any future re-analysis sees identical pixels.
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
@@ -780,14 +796,14 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         "background_removed": alpha is not None,
     }
 
-    if label == ANALYSIS_ANGLE:
+    if label in ANALYSIS_ANGLES:
         crop = fixed_analysis_crop(clean)
         left = (clean.width - ANALYSIS_CROP_SIZE) // 2
         top = (clean.height - ANALYSIS_CROP_SIZE) // 2
         alpha_crop = None
         if alpha is not None:
             alpha_crop = alpha[top : top + ANALYSIS_CROP_SIZE, left : left + ANALYSIS_CROP_SIZE]
-        crop_url = upload_webp_lossless(crop, f"right90_crop_{uid}.webp")
+        crop_url = upload_webp_lossless(crop, f"{label}_crop_{uid}.webp")
         angle_data.update(
             {
                 "crop_image_url": crop_url,
@@ -799,13 +815,13 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
                 },
                 "redness_score": compute_redness_score(crop, alpha_crop),
                 "white_score": compute_white_score(crop, alpha_crop),
-                **compute_quality(crop),
+                **compute_quality(crop, label),
             }
         )
 
     print(
         f"[handler] {label} OK"
-        + (f" redness={angle_data.get('redness_score')}" if label == ANALYSIS_ANGLE else "")
+        + (f" redness={angle_data.get('redness_score')}" if label in ANALYSIS_ANGLES else "")
     )
     return label, angle_data
 
@@ -898,22 +914,27 @@ def handler(job):
 
     if not isinstance(images, dict) or not isinstance(image_paths, dict):
         return {"error": "input.images and input.image_paths must be objects keyed by angle"}
-    if ANALYSIS_ANGLE not in images and ANALYSIS_ANGLE not in image_paths:
-        return {"error": f"Missing required {ANALYSIS_ANGLE} image"}
+    if PRIMARY_ANALYSIS_ANGLE not in images and PRIMARY_ANALYSIS_ANGLE not in image_paths:
+        return {"error": f"Missing required {PRIMARY_ANALYSIS_ANGLE} image"}
     if (scan_id or image_paths) and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
     processed_angles = process_images(images, image_paths, mode)
-    right90 = processed_angles.get(ANALYSIS_ANGLE, {})
+    primary = processed_angles.get(PRIMARY_ANALYSIS_ANGLE, {})
+    redness_avg = average_analysis_redness(processed_angles)
 
     if scan_id:
-        update_supabase_scan(scan_id, processed_angles, right90)
-        print(f"[handler] DB updated OK for scan_id={scan_id}")
+        update_supabase_scan(scan_id, processed_angles, primary)
+        print(
+            f"[handler] DB updated OK for scan_id={scan_id} "
+            f"redness_avg={redness_avg} angles={list(ANALYSIS_ANGLES)}"
+        )
 
     return {
         "status": "done",
         "scan_id": scan_id,
-        "analysis_angle": ANALYSIS_ANGLE,
+        "analysis_angles": list(ANALYSIS_ANGLES),
+        "redness_severity": redness_avg,
         "processed_angles": processed_angles,
     }
 
