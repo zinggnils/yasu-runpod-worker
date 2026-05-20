@@ -750,16 +750,39 @@ def _refine_one_angle(
 
 def apply_horizontal_shift(img_rgb: Image.Image, offset_x: int) -> Image.Image:
     """Shift subject left/right on the same canvas (black background)."""
+    return apply_refine_transform(img_rgb, int(offset_x), 0, 1.0)
+
+
+def apply_refine_transform(
+    img_rgb: Image.Image, offset_x: int, offset_y: int, scale: float
+) -> Image.Image:
+    """Scale around center, then translate on a fixed black canvas."""
+    scale = max(0.5, min(2.0, float(scale or 1.0)))
     w, h = img_rgb.size
-    arr = np.array(img_rgb.convert("RGB"))
+    working = img_rgb.convert("RGB")
+
+    if abs(scale - 1.0) > 1e-3:
+        nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        scaled = working.resize((nw, nh), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (w, h), (0, 0, 0))
+        canvas.paste(scaled, ((w - nw) // 2, (h - nh) // 2))
+        working = canvas
+
+    arr = np.array(working)
     out = np.zeros_like(arr)
-    if offset_x >= 0:
-        if offset_x < w:
-            out[:, offset_x:] = arr[:, : w - offset_x]
+    ox, oy = int(offset_x), int(offset_y)
+
+    if oy >= 0:
+        y_dst, y_src = slice(oy, h), slice(0, h - oy)
     else:
-        shift = -offset_x
-        if shift < w:
-            out[:, : w - shift] = arr[:, shift:]
+        y_dst, y_src = slice(0, h + oy), slice(-oy, h)
+
+    if ox >= 0:
+        x_dst, x_src = slice(ox, w), slice(0, w - ox)
+    else:
+        x_dst, x_src = slice(0, w + ox), slice(-ox, w)
+
+    out[y_dst, x_dst] = arr[y_src, x_src]
     return Image.fromarray(out, mode="RGB")
 
 
@@ -768,11 +791,13 @@ def commit_refined_angle(
     label: str,
     refined_url: str,
     offset_x: int,
+    offset_y: int,
+    scale: float,
     processed_angles: dict,
 ) -> dict:
     """Bake manual offset into the refined image and replace processed_angles[label]."""
     img = _download_processed_url(refined_url)
-    shifted = apply_horizontal_shift(img, int(offset_x))
+    shifted = apply_refine_transform(img, int(offset_x), int(offset_y), float(scale))
     uid = uuid.uuid4().hex[:10]
     if label in ANALYSIS_ANGLES:
         clean_url = upload_webp_lossless(shifted, f"clean_{label}_{uid}.webp")
@@ -783,6 +808,8 @@ def commit_refined_angle(
     prev["clean_image_url"] = clean_url
     prev["refined_at"] = datetime.now(timezone.utc).isoformat()
     prev["refine_offset_x"] = int(offset_x)
+    prev["refine_offset_y"] = int(offset_y)
+    prev["refine_scale"] = float(scale)
     return prev
 
 
@@ -1027,13 +1054,15 @@ def handler(job):
         label = job_input.get("angle")
         refined_url = job_input.get("refined_url")
         offset_x = int(job_input.get("offset_x") or 0)
+        offset_y = int(job_input.get("offset_y") or 0)
+        scale = float(job_input.get("scale") or 1.0)
         processed_angles = job_input.get("processed_angles") or {}
         if not scan_id or not label or not refined_url:
             return {"error": "commit_refine requires scan_id, angle, refined_url"}
         if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
             raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
         angle_data = commit_refined_angle(
-            scan_id, label, refined_url, offset_x, processed_angles
+            scan_id, label, refined_url, offset_x, offset_y, scale, processed_angles
         )
         update_supabase_processed_angle(scan_id, label, angle_data, processed_angles)
         print(f"[handler] commit_refine OK scan_id={scan_id} angle={label}")
