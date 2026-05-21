@@ -19,19 +19,25 @@ class Right90AnalysisTests(unittest.TestCase):
     def setUp(self):
         self._upload_jpeg = handler.upload_jpeg
         self._upload_webp_lossless = handler.upload_webp_lossless
+        self._upload_png = handler.upload_png
         handler.upload_jpeg = lambda _img, filename, quality=95: f"https://example.test/{filename}"
         handler.upload_webp_lossless = lambda _img, filename: f"https://example.test/{filename}"
+        handler.upload_png = lambda _img, filename: f"https://example.test/{filename}"
 
     def tearDown(self):
         handler.upload_jpeg = self._upload_jpeg
         handler.upload_webp_lossless = self._upload_webp_lossless
+        handler.upload_png = self._upload_png
 
-    def test_normalizes_and_crops_to_contract_sizes(self):
+    def test_right90_full_frame_ita_scoring(self):
         img = Image.new("RGB", (2160, 2700), (185, 126, 104))
 
         result = handler.process_images({"right_90": image_to_b64(img)}, {}, "redness")["right_90"]
 
-        self.assertEqual(result["crop_box"], {"x": 580, "y": 850, "width": 1000, "height": 1000})
+        self.assertEqual(result["scoring_method"], "ita_full_frame")
+        self.assertIn("redness_image_url", result)
+        self.assertTrue(result["redness_image_url"].endswith(".png"))
+        self.assertNotIn("crop_image_url", result)
         self.assertGreaterEqual(result["quality_score"], 0)
         self.assertLessEqual(result["quality_score"], 100)
 

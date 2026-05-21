@@ -689,6 +689,12 @@ def upload_webp_visual(img: Image.Image, filename: str, quality: int = 95) -> st
     return upload_bytes(webp_visual_bytes(img, quality=quality), filename, "image/webp")
 
 
+def upload_png(img: Image.Image, filename: str) -> str:
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="PNG", optimize=True)
+    return upload_bytes(buf.getvalue(), filename, "image/png")
+
+
 def make_analysis_map(
     img: Image.Image, mode: str = "redness", alpha: np.ndarray | None = None
 ) -> Image.Image:
@@ -713,37 +719,113 @@ def make_analysis_map(
     return Image.fromarray(rgb)
 
 
-def skin_mask(rgb: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lightness = lab[..., 0] * (100.0 / 255.0)
-    return (lightness > 18.0) & (lightness < 98.0)
+def _rgb_and_alpha(
+    clean: Image.Image, alpha: np.ndarray | None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """RGB uint8 (H,W,3), alpha float [0,1], alpha uint8 for erosion."""
+    rgb = np.array(clean.convert("RGB"))
+    h, w = rgb.shape[:2]
+    if alpha is None:
+        return rgb, np.ones((h, w), dtype=np.float32), np.full((h, w), 255, dtype=np.uint8)
+    alpha_u8 = alpha.astype(np.uint8)
+    return rgb, alpha_u8.astype(np.float32) / 255.0, alpha_u8
 
 
-def _face_mask(rgb: np.ndarray, alpha_crop: np.ndarray | None) -> np.ndarray:
-    """Combine brightness gating with the MODNet alpha matte so scoring
-    only sees actual face pixels — no background, no hair edge."""
-    mask = skin_mask(rgb)
-    if alpha_crop is not None:
-        # alpha > 200 -> definite foreground (avoids matte halo pixels).
-        mask &= alpha_crop > 200
-    return mask
+def _brightness(rgb: np.ndarray) -> np.ndarray:
+    return (
+        0.2126 * rgb[..., 0].astype(np.float32)
+        + 0.7152 * rgb[..., 1].astype(np.float32)
+        + 0.0722 * rgb[..., 2].astype(np.float32)
+    ) / 255.0
 
 
-def compute_redness_score(crop: Image.Image, alpha_crop: np.ndarray | None = None) -> int:
-    rgb = np.array(crop.convert("RGB"))
-    mask = _face_mask(rgb, alpha_crop)
-    if not np.any(mask):
+def inner_skin_mask(
+    rgb: np.ndarray,
+    alpha_u8: np.ndarray,
+    *,
+    brightness_min: float = 0.18,
+    erode_frac: float = 0.04,
+) -> np.ndarray:
+    """Eroded matte + brightness gate — excludes ears, hair halo, background."""
+    h, w = alpha_u8.shape
+    erode_px = max(15, int(min(h, w) * erode_frac))
+    eroded = cv2.erode(
+        alpha_u8, np.ones((erode_px, erode_px), np.uint8), iterations=1
+    )
+    return (eroded > 100) & (_brightness(rgb) > brightness_min)
+
+
+def compute_redness_score_ita(
+    clean: Image.Image, alpha: np.ndarray | None = None
+) -> int:
+    """ITA-style erythema 0–100 on full portrait: median a* baseline, top erythema pixels."""
+    rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
+    skin_mask = inner_skin_mask(rgb, alpha_u8, brightness_min=0.18)
+    if not np.any(skin_mask):
         return 0
 
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     a_star = lab[..., 1] - 128.0
-    redness = np.clip((a_star - 8.0) / 26.0, 0.0, 1.0)
-    return int(round(float(redness[mask].mean()) * 100))
+    baseline = float(np.median(a_star[skin_mask]))
+    ei = np.clip(a_star - baseline, 0, None)
+    ei_max = float(np.percentile(ei[skin_mask], 98))
+    ei_n = np.clip(ei / (ei_max + 1e-6), 0.0, 1.0)
+
+    face_skin = skin_mask & (alpha_f > 0.2)
+    if not np.any(face_skin):
+        return 0
+
+    rn = ei_n[face_skin]
+    p75 = float(np.percentile(rn, 75))
+    hot = rn[rn >= max(p75, 0.01)]
+    if hot.size == 0:
+        return 0
+    return int(min(100, round(float(hot.mean()) * 100)))
 
 
-def compute_white_score(crop: Image.Image, alpha_crop: np.ndarray | None = None) -> int:
-    rgb = np.array(crop.convert("RGB"))
-    mask = _face_mask(rgb, alpha_crop)
+def compute_redness_overlay(
+    clean: Image.Image, alpha: np.ndarray | None = None
+) -> Image.Image:
+    """Neon cyan blobs on elevated redness (full face). Returns RGBA overlay."""
+    rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
+    h, w = alpha_f.shape
+    r = rgb[..., 0].astype(np.float32)
+    g = rgb[..., 1].astype(np.float32)
+    b = rgb[..., 2].astype(np.float32)
+    redness = r - (g + b) / 2.0
+    brightness = _brightness(rgb)
+
+    skin_mask = inner_skin_mask(rgb, alpha_u8, brightness_min=0.24)
+    if not np.any(skin_mask):
+        return Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+    lo, hi = np.percentile(redness[skin_mask], [60, 98])
+    redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+    mask = redness_n * alpha_f
+    mask *= np.where(skin_mask, 1.0, 0.0)
+    mask *= np.clip((brightness - 0.15) / 0.85, 0.0, 1.0)
+    mask = np.clip((mask - 0.25) / 0.75, 0.0, 1.0)
+
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=6))
+    mask_arr = np.array(mask_img)
+
+    neon = np.zeros((h, w, 4), dtype=np.uint8)
+    neon[..., 0] = 40
+    neon[..., 1] = 220
+    neon[..., 2] = 255
+    neon[..., 3] = mask_arr
+    return Image.fromarray(neon, mode="RGBA")
+
+
+def apply_redness_overlay(clean: Image.Image, overlay_rgba: Image.Image) -> Image.Image:
+    base = clean.convert("RGB").convert("RGBA")
+    return Image.alpha_composite(base, overlay_rgba).convert("RGB")
+
+
+def compute_white_score(clean: Image.Image, alpha: np.ndarray | None = None) -> int:
+    rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
+    mask = inner_skin_mask(rgb, alpha_u8) & (alpha_f > 0.2)
     if not np.any(mask):
         return 0
 
@@ -756,7 +838,7 @@ def compute_white_score(crop: Image.Image, alpha_crop: np.ndarray | None = None)
     return int(round(float(white.sum()) / float(mask.sum()) * 100))
 
 
-def compute_quality(crop: Image.Image, label: str = "analysis") -> dict:
+def compute_quality(clean: Image.Image, label: str = "analysis") -> dict:
     gray = cv2.cvtColor(np.array(crop.convert("RGB")), cv2.COLOR_RGB2GRAY)
     blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     contrast = float(gray.std())
@@ -804,8 +886,9 @@ def update_supabase_scan(scan_id: str, processed_angles: dict, primary: dict) ->
     body = {
         "status": "done",
         "processed_angles": processed_angles,
-        "clean_image_url": primary.get("crop_image_url") or primary.get("clean_image_url"),
-        "redness_image_url": primary.get("visia_image_url"),
+        "clean_image_url": primary.get("clean_image_url"),
+        "redness_image_url": primary.get("redness_image_url")
+        or primary.get("visia_image_url"),
         "image_url": primary.get("visia_image_url"),
         "redness_severity": redness_severity,
     }
@@ -1029,7 +1112,8 @@ def update_supabase_processed_angle(
     redness_severity = average_analysis_redness(merged)
     body = {
         "processed_angles": merged,
-        "clean_image_url": primary.get("crop_image_url") or primary.get("clean_image_url"),
+        "clean_image_url": primary.get("clean_image_url"),
+        "redness_image_url": primary.get("redness_image_url"),
         "redness_severity": redness_severity,
         "studio_angles": None,
         "studio_image_url": None,
@@ -1065,8 +1149,6 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     visia = make_analysis_map(clean, mode, alpha=alpha)
 
     if label in ANALYSIS_ANGLES:
-        # Analysis-grade: bit-exact lossless WebP for the full clean frame
-        # and the ROI crop, so any future re-analysis sees identical pixels.
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     else:
         # Display-only angles: q=95 WebP is visually indistinguishable on
@@ -1083,15 +1165,16 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        crop, alpha_crop, crop_box = analysis_roi_crop(clean, alpha, label)
-        crop_url = upload_webp_lossless(crop, f"{label}_crop_{uid}.webp")
+        overlay = compute_redness_overlay(clean, alpha)
+        redness_on_clean = apply_redness_overlay(clean, overlay)
+        redness_url = upload_png(redness_on_clean, f"redness_{label}_{uid}.png")
         angle_data.update(
             {
-                "crop_image_url": crop_url,
-                "crop_box": crop_box,
-                "redness_score": compute_redness_score(crop, alpha_crop),
-                "white_score": compute_white_score(crop, alpha_crop),
-                **compute_quality(crop, label),
+                "redness_image_url": redness_url,
+                "redness_score": compute_redness_score_ita(clean, alpha),
+                "white_score": compute_white_score(clean, alpha),
+                "scoring_method": "ita_full_frame",
+                **compute_quality(clean, label),
             }
         )
 
