@@ -92,11 +92,13 @@ GEMINI_FRAGMENT_REQUIRED = os.environ.get(
 ).lower() in ("1", "true", "yes")
 
 
-def extract_cheek_gemini_fragment(visia: Image.Image) -> tuple[Image.Image, str, int, dict]:
+def extract_cheek_gemini_fragment(
+    visia: Image.Image, *, visia_webp: bytes | None = None
+) -> tuple[Image.Image, str, int, dict]:
     """Exact product prompt on VISIA → fragment PNG for Supabase."""
     timing: dict = {}
     t0 = datetime.now(timezone.utc)
-    fragment, err = gemini_fragment.run_gemini_fragment(visia)
+    fragment, err = gemini_fragment.run_gemini_fragment(visia, visia_webp=visia_webp)
     timing["gemini_ms"] = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
     timing["gemini_model"] = gemini_fragment.GEMINI_FRAGMENT_MODEL
 
@@ -1045,10 +1047,12 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     cheek_method = ""
     cheek_pixels = 0
     cheek_timing: dict = {}
+    visia_webp_for_api: bytes | None = None
     if label in ANALYSIS_ANGLES:
-        # Run Gemini before large Supabase uploads so slow API work starts ASAP.
+        # right_90: WebP payload to Gemini only (smaller upload, same VISIA pixels).
+        visia_webp_for_api = webp_visual_bytes(visia, quality=95)
         cheek_preview, cheek_method, cheek_pixels, cheek_timing = (
-            extract_cheek_gemini_fragment(visia)
+            extract_cheek_gemini_fragment(visia, visia_webp=visia_webp_for_api)
         )
 
     if label in ANALYSIS_ANGLES:
