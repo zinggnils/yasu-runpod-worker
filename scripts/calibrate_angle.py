@@ -63,7 +63,7 @@ def main() -> None:
     bone_rgb = np.array(visia.convert("RGB"))
     landmarks = handler.detect_face_landmarks(rgb)
     cheek_img, cheek_method, cheek_pixels = handler.extract_cheek_tight_bone(
-        bone_rgb, alpha, landmarks
+        bone_rgb, rgb, alpha, landmarks
     )
     cheek_img.save(out_dir / "07_cheek_bone_tight.png", quality=95)
 

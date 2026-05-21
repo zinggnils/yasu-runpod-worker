@@ -35,5 +35,11 @@ RUN mkdir -p /root/.mediapipe && \
     curl -fL https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task \
       -o /root/.mediapipe/face_landmarker.task
 
-COPY handler.py .
+RUN mkdir -p /root/.mobilesam && \
+    curl -fL https://huggingface.co/Acly/MobileSAM/resolve/main/mobile_sam_image_encoder.onnx \
+      -o /root/.mobilesam/mobile_sam_image_encoder.onnx && \
+    curl -fL https://huggingface.co/Acly/MobileSAM/resolve/main/sam_mask_decoder_single.onnx \
+      -o /root/.mobilesam/sam_mask_decoder_single.onnx
+
+COPY mobile_sam_onnx.py handler.py .
 CMD ["python", "-u", "handler.py"]

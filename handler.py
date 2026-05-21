@@ -12,6 +12,8 @@ import onnxruntime as ort
 import requests
 from PIL import Image, ImageFilter, ImageOps
 
+from mobile_sam_onnx import MobileSamOnnx
+
 # Register the HEIF/HEIC opener with Pillow so Image.open() auto-detects HEIC
 # bytes (the format the iOS app uploads). Pillow's auto-detect reads the file
 # header, so no other code in this module needs to know the input format.
@@ -83,19 +85,29 @@ def _init_matting():
 MATTING_SESSION = _init_matting()
 
 # ---------------------------------------------------------------------------
-# MediaPipe Face Landmarker — right_90 cheek polygon (fast CPU, ~50–150 ms)
+# Cheek ROI: single-point MobileSAM on BONE visia (landmarks only place the point)
 # ---------------------------------------------------------------------------
 FACE_LANDMARKER_PATH = os.environ.get(
     "FACE_LANDMARKER_PATH", "/root/.mediapipe/face_landmarker.task"
 )
-LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "1280"))
+LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "960"))
 CHEEK_TIGHT_PADDING = int(os.environ.get("CHEEK_TIGHT_PADDING", "24"))
-CHEEK_MASK_FEATHER = int(os.environ.get("CHEEK_MASK_FEATHER", "3"))
+# right_90 profile: default cheek center if landmarks fail (fraction of width/height).
+RIGHT_90_CHEEK_POINT_XY = (
+    float(os.environ.get("RIGHT_90_CHEEK_X", "0.42")),
+    float(os.environ.get("RIGHT_90_CHEEK_Y", "0.40")),
+)
 
-# Subject's right cheek — ordered polygon (Face Mesh indices). right_90 shows this cheek.
+# Centroid of subject's right cheek (Face Mesh indices).
 _RIGHT_CHEEK_CORE = (
     345, 352, 376, 411, 427, 426, 425, 266, 371, 355, 437, 343, 357, 350, 349, 348, 347, 346,
 )
+
+MOBILE_SAM = MobileSamOnnx()
+if MOBILE_SAM.ready:
+    print("[mobile_sam] encoder+decoder OK")
+else:
+    print("[mobile_sam] ONNX models missing — cheek ROI will use alpha fallback")
 
 
 def _init_face_landmarker():
@@ -156,22 +168,21 @@ def detect_face_landmarks(rgb: np.ndarray):
     return result.face_landmarks[0]
 
 
-def _cheek_polygon_points(landmarks, width: int, height: int) -> np.ndarray | None:
-    """Ordered malar polygon for subject's right cheek (right_90)."""
-    try:
-        points = np.array(
-            [
-                (int(landmarks[i].x * width), int(landmarks[i].y * height))
-                for i in _RIGHT_CHEEK_CORE
-                if i < len(landmarks)
-            ],
-            dtype=np.int32,
-        )
-    except (IndexError, TypeError):
-        return None
-    if points.shape[0] < 3:
-        return None
-    return points
+def cheek_point_right_90(landmarks, width: int, height: int) -> tuple[int, int]:
+    """One positive SAM point — centroid of right cheek landmarks or profile default."""
+    if landmarks is not None:
+        xs: list[float] = []
+        ys: list[float] = []
+        for i in _RIGHT_CHEEK_CORE:
+            if i < len(landmarks):
+                xs.append(landmarks[i].x * width)
+                ys.append(landmarks[i].y * height)
+        if xs:
+            return int(round(sum(xs) / len(xs))), int(round(sum(ys) / len(ys)))
+    return (
+        int(RIGHT_90_CHEEK_POINT_XY[0] * width),
+        int(RIGHT_90_CHEEK_POINT_XY[1] * height),
+    )
 
 
 def _eroded_alpha_u8(alpha: np.ndarray, h: int, w: int) -> np.ndarray:
@@ -185,65 +196,47 @@ def _eroded_alpha_u8(alpha: np.ndarray, h: int, w: int) -> np.ndarray:
 
 def extract_cheek_tight_bone(
     bone_rgb: np.ndarray,
+    clean_rgb: np.ndarray,
     alpha: np.ndarray | None,
     landmarks,
 ) -> tuple[Image.Image, str, int]:
     """
-    Tight cheek fragment on black from BONE colormap image.
-    Landmarks from clean RGB; mask applied to visia/bone output.
+    Tight cheek on black from BONE visia.
+    SAM runs on clean RGB; mask is applied to bone_rgb.
     """
     h, w = bone_rgb.shape[:2]
-    points = _cheek_polygon_points(landmarks, w, h) if landmarks is not None else None
-    method = "mediapipe_core_bone_tight"
+    point = cheek_point_right_90(landmarks, w, h)
+    method = "mobile_sam_point_bone"
 
-    if points is None:
-        method = "bone_alpha_fallback"
+    mask = MOBILE_SAM.predict_mask(clean_rgb, point, positive=1)
+    if mask is None or not np.any(mask):
+        method = "point_fallback_alpha"
         if alpha is None:
-            return Image.fromarray(np.zeros_like(bone_rgb)), method, 0
+            return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0
         eroded = _eroded_alpha_u8(alpha, h, w)
         mask = eroded > 100
         cols = np.where(np.any(mask, axis=0))[0]
         if cols.size:
             x_cut = int(cols[0] + (cols[-1] - cols[0]) * 0.68)
             mask &= np.arange(w) <= x_cut
-        points = cv2.findNonZero(mask.astype(np.uint8) * 255)
-        if points is None:
-            return Image.fromarray(np.zeros_like(bone_rgb)), method, 0
-        x, y, bw, bh = cv2.boundingRect(points)
-    else:
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [points], 255)
-        if alpha is not None:
-            mask = cv2.bitwise_and(mask, _eroded_alpha_u8(alpha, h, w))
-        if CHEEK_MASK_FEATHER > 0:
-            k = CHEEK_MASK_FEATHER * 2 + 1
-            mask = cv2.GaussianBlur(mask, (k, k), CHEEK_MASK_FEATHER)
-        x, y, bw, bh = cv2.boundingRect(points)
 
+    if alpha is not None:
+        mask &= _eroded_alpha_u8(alpha, h, w) > 100
+
+    if not np.any(mask):
+        return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0
+
+    ys, xs = np.where(mask)
     pad = CHEEK_TIGHT_PADDING
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(w, x + bw + pad)
-    y2 = min(h, y + bh + pad)
+    x1 = max(0, int(xs.min()) - pad)
+    y1 = max(0, int(ys.min()) - pad)
+    x2 = min(w, int(xs.max()) + pad + 1)
+    y2 = min(h, int(ys.max()) + pad + 1)
 
     crop = bone_rgb[y1:y2, x1:x2].copy()
-    if points is not None and landmarks is not None:
-        mask_full = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask_full, [points], 255)
-        if alpha is not None:
-            mask_full = cv2.bitwise_and(mask_full, _eroded_alpha_u8(alpha, h, w))
-        if CHEEK_MASK_FEATHER > 0:
-            k = CHEEK_MASK_FEATHER * 2 + 1
-            mask_full = cv2.GaussianBlur(mask_full, (k, k), CHEEK_MASK_FEATHER)
-        mask_crop = mask_full[y1:y2, x1:x2]
-        crop[mask_crop < 128] = 0
-        pixels = int((mask_crop >= 128).sum())
-    else:
-        eroded = _eroded_alpha_u8(alpha, h, w) if alpha is not None else np.full((h, w), 255, np.uint8)
-        mask_crop = eroded[y1:y2, x1:x2]
-        crop[mask_crop <= 100] = 0
-        pixels = int((mask_crop > 100).sum())
-
+    mask_crop = mask[y1:y2, x1:x2]
+    crop[~mask_crop] = 0
+    pixels = int(mask_crop.sum())
     return Image.fromarray(crop, mode="RGB"), method, pixels
 
 
@@ -1200,7 +1193,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         t_lm = datetime.now(timezone.utc)
         landmarks = detect_face_landmarks(rgb)
         cheek_preview, cheek_method, cheek_pixels = extract_cheek_tight_bone(
-            bone_rgb, alpha, landmarks
+            bone_rgb, rgb, alpha, landmarks
         )
         cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
         lm_ms = int(
@@ -1218,7 +1211,8 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         )
         print(
             f"[handler] {label} cheek_roi method={cheek_method} "
-            f"pixels={cheek_pixels} landmark_ms={lm_ms}"
+            f"point={cheek_point_right_90(landmarks, bone_rgb.shape[1], bone_rgb.shape[0])} "
+            f"pixels={cheek_pixels} landmark_ms={lm_ms} sam_ready={MOBILE_SAM.ready}"
         )
 
     print(f"[handler] {label} OK")
