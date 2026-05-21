@@ -93,13 +93,15 @@ def trigger_gemini_cheek_fragment(scan_id: str) -> None:
         print("[handler] skip gemini-cheek-fragment trigger (no Supabase config)")
         return
     url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/gemini-cheek-fragment"
-    # Supabase service-to-service: secret/publishable keys go on apikey, not Authorization Bearer.
+    # Prefer dedicated trigger secret; else project secret on apikey (sb_secret_… or legacy JWT).
+    trigger_secret = os.environ.get("YASU_FRAGMENT_TRIGGER_SECRET", "").strip()
+    apikey = trigger_secret or SUPABASE_SERVICE_KEY
     headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
+        "apikey": apikey,
         "Content-Type": "application/json",
     }
     key = SUPABASE_SERVICE_KEY.strip()
-    if key.startswith("eyJ"):
+    if key.startswith("eyJ") and not trigger_secret:
         headers["Authorization"] = f"Bearer {key}"
 
     try:
