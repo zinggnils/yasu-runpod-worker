@@ -106,18 +106,27 @@ def main() -> None:
         alpha_crop = alpha[top : top + handler.ANALYSIS_CROP_SIZE, left : left + handler.ANALYSIS_CROP_SIZE]
     crop.save(out_dir / "05_center_crop_1000.jpg", quality=95)
 
-    overlay = handler.compute_redness_overlay(clean, alpha)
+    rgb = np.array(clean.convert("RGB"))
+    alpha_u8 = alpha.astype(np.uint8) if alpha is not None else None
+    parse_mask = handler.predict_face_parse_mask(rgb)
+    cheek_mask, mask_method = handler.cheek_mask_for_angle(
+        rgb, alpha_u8, parse_mask, args.angle
+    )
+    overlay = handler.compute_redness_overlay(clean, alpha, cheek_mask=cheek_mask)
     redness_on_clean = handler.apply_redness_overlay(clean, overlay)
     redness_on_clean.save(out_dir / "08_redness_overlay.png")
+    Image.fromarray((cheek_mask.astype(np.uint8) * 255)).save(out_dir / "09_cheek_mask.png")
 
     bbox = handler.detect_face_bbox(clean, args.angle)
     scores = {
         "angle": args.angle,
-        "ita_full_frame": {
-            "redness_score": handler.compute_redness_score_ita(clean, alpha),
+        "cheek_bisenet_pct": {
+            "redness_score": handler.compute_redness_score_cheek(clean, alpha, cheek_mask),
             "white_score": handler.compute_white_score(clean, alpha),
+            "cheek_pixels": int(cheek_mask.sum()),
+            "ei_threshold": handler.REDNESS_EI_THRESHOLD,
             **handler.compute_quality(clean, args.angle),
-            "scoring_method": "ita_full_frame",
+            "scoring_method": f"{mask_method}_pct_ei",
         },
         "center_crop_legacy": {
             "redness_score": handler.compute_redness_score_ita(crop, alpha_crop),

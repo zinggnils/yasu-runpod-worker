@@ -20,5 +20,9 @@ RUN mkdir -p /root/.modnet && \
     curl -fL https://github.com/yakhyo/modnet/releases/download/weights/modnet_photographic.onnx \
       -o /root/.modnet/modnet_photographic.onnx
 
+RUN mkdir -p /root/.face-parse && \
+    curl -fL https://github.com/yakhyo/face-parsing/releases/download/weights/resnet18.onnx \
+      -o /root/.face-parse/resnet18.onnx
+
 COPY handler.py .
 CMD ["python", "-u", "handler.py"]

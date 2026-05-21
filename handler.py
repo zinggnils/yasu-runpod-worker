@@ -82,6 +82,99 @@ def _init_matting():
 
 MATTING_SESSION = _init_matting()
 
+# ---------------------------------------------------------------------------
+# BiSeNet face parsing (CelebAMask-style) — cheek ROI for right_90 scoring
+# ---------------------------------------------------------------------------
+FACE_PARSE_MODEL_PATH = os.environ.get(
+    "FACE_PARSE_MODEL_PATH", "/root/.face-parse/resnet18.onnx"
+)
+FACE_PARSE_INPUT_SIZE = (512, 512)
+# Lab erythema index above per-face baseline (a* units) counts as "red".
+REDNESS_EI_THRESHOLD = float(os.environ.get("REDNESS_EI_THRESHOLD", "8.0"))
+# yakhyo/face-parsing class indices (1-based in ATTRIBUTES list).
+_PARSE_SKIN = 1
+_PARSE_EARS = {7, 8, 9}  # l_ear, r_ear, ear_r
+
+
+def _init_face_parse():
+    model_path = Path(FACE_PARSE_MODEL_PATH)
+    if not model_path.exists() or model_path.stat().st_size == 0:
+        print(f"[face_parse] model not found at {model_path}; cheek mask falls back to eroded alpha")
+        return None
+    try:
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = max(1, (os.cpu_count() or 4) // 2)
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess = ort.InferenceSession(
+            str(model_path), opts, providers=["CPUExecutionProvider"]
+        )
+        print(f"[face_parse] session OK providers={sess.get_providers()}")
+        return sess
+    except Exception as exc:  # noqa: BLE001
+        print(f"[face_parse] init failed: {exc}")
+        return None
+
+
+FACE_PARSE_SESSION = _init_face_parse()
+_FACE_PARSE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_FACE_PARSE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def predict_face_parse_mask(rgb: np.ndarray) -> np.ndarray | None:
+    """Semantic labels (H,W) uint8 at full resolution, or None if parser disabled."""
+    if FACE_PARSE_SESSION is None:
+        return None
+    h, w = rgb.shape[:2]
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    resized = cv2.resize(bgr, FACE_PARSE_INPUT_SIZE, interpolation=cv2.INTER_LINEAR)
+    img = resized.astype(np.float32) / 255.0
+    img = (img - _FACE_PARSE_MEAN) / _FACE_PARSE_STD
+    chw = np.transpose(img, (2, 0, 1))[None, ...].astype(np.float32)
+    inp = FACE_PARSE_SESSION.get_inputs()[0].name
+    out = FACE_PARSE_SESSION.run(None, {inp: chw})[0]
+    labels = out.squeeze(0).argmax(0).astype(np.uint8)
+    return cv2.resize(labels, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def cheek_mask_for_angle(
+    rgb: np.ndarray,
+    alpha_u8: np.ndarray | None,
+    parse_mask: np.ndarray | None,
+    label: str,
+) -> tuple[np.ndarray, str]:
+    """Cheek-only boolean mask for scoring + overlay."""
+    h, w = rgb.shape[:2]
+    if parse_mask is not None:
+        cheek = parse_mask == _PARSE_SKIN
+        for ear_cls in _PARSE_EARS:
+            cheek &= parse_mask != ear_cls
+        method = "bisenet_cheek"
+    else:
+        cheek = np.zeros((h, w), dtype=bool)
+        method = "erode_fallback"
+
+    if alpha_u8 is not None:
+        erode_px = max(15, int(min(h, w) * 0.04))
+        eroded = cv2.erode(
+            alpha_u8, np.ones((erode_px, erode_px), np.uint8), iterations=1
+        )
+        cheek &= eroded > 100
+    cheek &= _brightness(rgb) > 0.18
+
+    if label == "right_90" and np.any(cheek):
+        # Profile: drop rightmost skin strip (patient's ear / edge blob).
+        xs = np.arange(w, dtype=np.float32)
+        x_cut = float(np.percentile(xs[np.any(cheek, axis=0)], 88))
+        cheek &= xs <= x_cut
+
+    if not np.any(cheek):
+        cheek = inner_skin_mask(
+            rgb, alpha_u8 if alpha_u8 is not None else np.full((h, w), 255, np.uint8)
+        )
+        method = "erode_fallback"
+
+    return cheek, method
+
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
     """Resize to MODNET_INPUT_SIZE long edge, with both sides multiples of
@@ -783,10 +876,31 @@ def compute_redness_score_ita(
     return int(min(100, round(float(hot.mean()) * 100)))
 
 
+def compute_redness_score_cheek(
+    clean: Image.Image,
+    alpha: np.ndarray | None,
+    cheek_mask: np.ndarray,
+) -> int:
+    """% of cheek pixels with erythema index above threshold (scale-invariant)."""
+    rgb, alpha_f, _ = _rgb_and_alpha(clean, alpha)
+    mask = cheek_mask & (alpha_f > 0.2)
+    if not np.any(mask):
+        return 0
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    a_star = lab[..., 1] - 128.0
+    baseline = float(np.median(a_star[mask]))
+    ei = a_star - baseline
+    pct = float(np.mean(ei[mask] > REDNESS_EI_THRESHOLD))
+    return int(min(100, round(pct * 100)))
+
+
 def compute_redness_overlay(
-    clean: Image.Image, alpha: np.ndarray | None = None
+    clean: Image.Image,
+    alpha: np.ndarray | None = None,
+    cheek_mask: np.ndarray | None = None,
 ) -> Image.Image:
-    """Neon cyan blobs on elevated redness (full face). Returns RGBA overlay."""
+    """Neon cyan on elevated redness inside cheek_mask. Returns RGBA overlay."""
     rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
     h, w = alpha_f.shape
     r = rgb[..., 0].astype(np.float32)
@@ -795,7 +909,10 @@ def compute_redness_overlay(
     redness = r - (g + b) / 2.0
     brightness = _brightness(rgb)
 
-    skin_mask = inner_skin_mask(rgb, alpha_u8, brightness_min=0.24)
+    if cheek_mask is not None and np.any(cheek_mask):
+        skin_mask = cheek_mask
+    else:
+        skin_mask = inner_skin_mask(rgb, alpha_u8, brightness_min=0.24)
     if not np.any(skin_mask):
         return Image.new("RGBA", (w, h), (0, 0, 0, 0))
 
@@ -1165,15 +1282,23 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        overlay = compute_redness_overlay(clean, alpha)
+        rgb = np.array(clean.convert("RGB"))
+        alpha_u8 = alpha.astype(np.uint8) if alpha is not None else None
+        parse_mask = predict_face_parse_mask(rgb)
+        cheek_mask, mask_method = cheek_mask_for_angle(
+            rgb, alpha_u8, parse_mask, label
+        )
+        overlay = compute_redness_overlay(clean, alpha, cheek_mask=cheek_mask)
         redness_on_clean = apply_redness_overlay(clean, overlay)
         redness_url = upload_png(redness_on_clean, f"redness_{label}_{uid}.png")
+        score = compute_redness_score_cheek(clean, alpha, cheek_mask)
         angle_data.update(
             {
                 "redness_image_url": redness_url,
-                "redness_score": compute_redness_score_ita(clean, alpha),
+                "redness_score": score,
                 "white_score": compute_white_score(clean, alpha),
-                "scoring_method": "ita_full_frame",
+                "scoring_method": f"{mask_method}_pct_ei",
+                "cheek_pixel_count": int(cheek_mask.sum()),
                 **compute_quality(clean, label),
             }
         )

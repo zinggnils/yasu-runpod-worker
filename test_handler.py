@@ -29,17 +29,17 @@ class Right90AnalysisTests(unittest.TestCase):
         handler.upload_webp_lossless = self._upload_webp_lossless
         handler.upload_png = self._upload_png
 
-    def test_right90_full_frame_ita_scoring(self):
+    def test_right90_cheek_pct_scoring(self):
         img = Image.new("RGB", (2160, 2700), (185, 126, 104))
 
         result = handler.process_images({"right_90": image_to_b64(img)}, {}, "redness")["right_90"]
 
-        self.assertEqual(result["scoring_method"], "ita_full_frame")
+        self.assertIn("pct_ei", result["scoring_method"])
         self.assertIn("redness_image_url", result)
         self.assertTrue(result["redness_image_url"].endswith(".png"))
         self.assertNotIn("crop_image_url", result)
-        self.assertGreaterEqual(result["quality_score"], 0)
-        self.assertLessEqual(result["quality_score"], 100)
+        self.assertGreaterEqual(result["redness_score"], 0)
+        self.assertLessEqual(result["redness_score"], 100)
 
     def test_handler_only_requires_right90_image(self):
         img = Image.new("RGB", (1080, 1920), (210, 150, 140))
@@ -47,7 +47,7 @@ class Right90AnalysisTests(unittest.TestCase):
         result = handler.handler({"input": {"images": {"right_90": image_to_b64(img)}}})
 
         self.assertEqual(result["status"], "done")
-        self.assertEqual(result["analysis_angle"], "right_90")
+        self.assertIn("right_90", result["analysis_angles"])
         self.assertIn("right_90", result["processed_angles"])
         self.assertIn("redness_score", result["processed_angles"]["right_90"])
         self.assertIn("white_score", result["processed_angles"]["right_90"])
