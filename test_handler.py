@@ -25,7 +25,7 @@ class Right90PrepTests(unittest.TestCase):
         handler.upload_png = lambda _img, filename: f"https://example.test/{filename}"
         self._gemini = gemini_fragment.run_gemini_fragment
         # Passthrough: return input-sized fragment for tests without API key.
-        gemini_fragment.run_gemini_fragment = lambda visia, **_: (
+        gemini_fragment.run_gemini_fragment = lambda visia: (
             visia.convert("RGB"),
             None,
         )

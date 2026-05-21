@@ -10,11 +10,9 @@ import cv2
 import numpy as np
 from PIL import Image
 
-# Quiet SDK chatter; we log milestones ourselves.
 logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 
-# Exact prompt from product spec (Gemini 3.1 / Nano Banana workflow).
 GEMINI_FRAGMENT_PROMPT = """Deconstruct the portrait into fragmented, isolated skin texture pieces.
 Extract only the cheek and jaw area as a single irregular polygon shape —
 no eyes, no nose, no full face. Float the fragment on pure black background.
@@ -25,12 +23,15 @@ lastly remove all shapes but the biggest one completely from the picture
 IMPORTANT: Final check, if there are still any Parts of the eye, mouth, nose, ear to See remove from Fragment"""
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+# 2.5 Flash Image is much faster than 3.1 preview for API (~15–25s vs 60–120s+).
+# Set GEMINI_FRAGMENT_MODEL=gemini-3.1-flash-image-preview for max quality (slower).
 GEMINI_FRAGMENT_MODEL = os.environ.get(
-    "GEMINI_FRAGMENT_MODEL", "gemini-3.1-flash-image-preview"
+    "GEMINI_FRAGMENT_MODEL", "gemini-2.5-flash-image"
 )
-# 0 = send full-resolution VISIA (no downscale). Set e.g. 1536 only to cap upload size.
-GEMINI_FRAGMENT_MAX_EDGE = int(os.environ.get("GEMINI_FRAGMENT_MAX_EDGE", "0"))
-GEMINI_FRAGMENT_TIMEOUT_S = int(os.environ.get("GEMINI_FRAGMENT_TIMEOUT_S", "120"))
+# API-only cap after cheek crop (stored VISIA in Supabase stays full-res JPEG).
+GEMINI_FRAGMENT_MAX_EDGE = int(os.environ.get("GEMINI_FRAGMENT_MAX_EDGE", "1024"))
+GEMINI_FRAGMENT_JPEG_QUALITY = int(os.environ.get("GEMINI_FRAGMENT_JPEG_QUALITY", "92"))
+GEMINI_FRAGMENT_TIMEOUT_S = int(os.environ.get("GEMINI_FRAGMENT_TIMEOUT_S", "90"))
 
 
 def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:
@@ -52,7 +53,6 @@ def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:
 
 
 def _prepare_input(img: Image.Image) -> Image.Image:
-    """Optional downscale — off by default (GEMINI_FRAGMENT_MAX_EDGE=0)."""
     rgb = img.convert("RGB")
     if GEMINI_FRAGMENT_MAX_EDGE <= 0:
         return rgb
@@ -66,16 +66,21 @@ def _prepare_input(img: Image.Image) -> Image.Image:
     )
 
 
-def run_gemini_fragment(
-    visia: Image.Image,
-    *,
-    visia_webp: bytes | None = None,
-) -> tuple[Image.Image | None, str | None]:
-    """
-    Send VISIA (BONE duotone) + prompt to Gemini; return edited image or (None, error).
+def _api_jpeg_bytes(img: Image.Image) -> bytes:
+    buf = BytesIO()
+    img.save(
+        buf,
+        format="JPEG",
+        quality=GEMINI_FRAGMENT_JPEG_QUALITY,
+        optimize=True,
+    )
+    return buf.getvalue()
 
-    Pass pre-encoded `visia_webp` from the worker (right_90) for a smaller/faster
-    API payload without changing stored VISIA quality in Supabase.
+
+def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | None]:
+    """
+    Send cheek-cropped VISIA (caller should pass ~1000×1000) + prompt to Gemini.
+    Full-resolution VISIA for storage is handled separately in handler.
     """
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY not set"
@@ -86,14 +91,11 @@ def run_gemini_fragment(
     except ImportError as exc:
         return None, f"google-genai not installed: {exc}"
 
+    prepared = _prepare_input(visia)
+    jpeg = _api_jpeg_bytes(prepared)
+
     http_options = types.HttpOptions(timeout=GEMINI_FRAGMENT_TIMEOUT_S * 1000)
     client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
-    prepared = _prepare_input(visia)
-    if visia_webp is None:
-        buf = BytesIO()
-        prepared.save(buf, format="WEBP", quality=95, method=4)
-        visia_webp = buf.getvalue()
-    mime = "image/webp"
 
     config = types.GenerateContentConfig(
         response_modalities=["IMAGE"],
@@ -102,7 +104,7 @@ def run_gemini_fragment(
 
     print(
         f"[gemini_fragment] request model={GEMINI_FRAGMENT_MODEL} "
-        f"visia_in={visia.size} api_in={prepared.size} webp_kb={len(visia_webp) // 1024} "
+        f"in={visia.size} api={prepared.size} jpeg_kb={len(jpeg) // 1024} "
         f"timeout_s={GEMINI_FRAGMENT_TIMEOUT_S}"
     )
 
@@ -110,7 +112,7 @@ def run_gemini_fragment(
         response = client.models.generate_content(
             model=GEMINI_FRAGMENT_MODEL,
             contents=[
-                types.Part.from_bytes(data=visia_webp, mime_type=mime),
+                types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"),
                 GEMINI_FRAGMENT_PROMPT,
             ],
             config=config,
@@ -129,7 +131,6 @@ def run_gemini_fragment(
         if inline is not None and inline.data:
             out = Image.open(BytesIO(inline.data)).convert("RGB")
             return _keep_largest_fragment(out), None
-        # Some SDK versions expose as part.as_image()
         try:
             out = part.as_image()
             if out is not None:
