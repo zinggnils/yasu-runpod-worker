@@ -92,11 +92,18 @@ FACE_LANDMARKER_PATH = os.environ.get(
 )
 LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "960"))
 CHEEK_TIGHT_PADDING = int(os.environ.get("CHEEK_TIGHT_PADDING", "24"))
-CLIPSEG_CHEEK_PROMPT = os.environ.get("CLIPSEG_CHEEK_PROMPT", "malar region skin")
+CLIPSEG_CHEEK_PROMPT = os.environ.get(
+    "CLIPSEG_CHEEK_PROMPT", "cheek and jaw skin texture"
+)
 CLIPSEG_EAR_PROMPT = os.environ.get("CLIPSEG_EAR_PROMPT", "ear")
 CLIPSEG_EAR_THRESHOLD = float(os.environ.get("CLIPSEG_EAR_THRESHOLD", "0.35"))
+# Subtract eye/nose/mouth blobs (comma-separated CLIPSeg prompts).
+CLIPSEG_EXCLUDE_PROMPTS = os.environ.get("CLIPSEG_EXCLUDE_PROMPTS", "eye,nose,mouth")
+CLIPSEG_EXCLUDE_THRESHOLD = float(os.environ.get("CLIPSEG_EXCLUDE_THRESHOLD", "0.38"))
 # Profile ear strip: keep left fraction of cheek mask span (right_90).
 PROFILE_EAR_X_KEEP = float(os.environ.get("PROFILE_EAR_X_KEEP", "0.68"))
+# Sharp angular polygon from largest fragment (lower = more corners).
+POLYGON_EPSILON_FRAC = float(os.environ.get("POLYGON_EPSILON_FRAC", "0.014"))
 
 # Warm CLIPSeg weights at import (long first cold start moved to image build).
 clipseg_cheek._load()
@@ -210,6 +217,67 @@ def remove_ear_from_mask(
     return out.astype(bool)
 
 
+def _exclude_eyes_nose_mouth(
+    mask: np.ndarray,
+    clean_rgb: np.ndarray,
+    landmarks,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Remove eyes, nose, mouth via CLIPSeg subtract + landmark caps."""
+    h, w = height, width
+    out = mask.copy()
+    for prompt in [p.strip() for p in CLIPSEG_EXCLUDE_PROMPTS.split(",") if p.strip()]:
+        ex = clipseg_cheek.predict_mask(
+            clean_rgb, prompt, threshold=CLIPSEG_EXCLUDE_THRESHOLD
+        )
+        if ex is not None:
+            out &= ~ex
+
+    if landmarks is not None:
+        eye_ids = (33, 133, 159, 145, 263, 362, 386, 374, 249, 390)
+        eye_ys = [landmarks[i].y * h for i in eye_ids if i < len(landmarks)]
+        if eye_ys:
+            out[: int(max(eye_ys) + 0.02 * h), :] = False
+        if len(landmarks) > 1:
+            nx = int(landmarks[1].x * w)
+            band = int(0.07 * w)
+            out[:, max(0, nx - band) : min(w, nx + band)] = False
+    return out.astype(bool)
+
+
+def _keep_largest_component(mask: np.ndarray) -> np.ndarray:
+    """Keep only the biggest connected region (drop all smaller fragments)."""
+    u8 = (mask.astype(np.uint8) * 255)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
+    if n_labels <= 1:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if areas.size == 0:
+        return mask
+    best = 1 + int(np.argmax(areas))
+    return labels == best
+
+
+def _angular_polygon_mask(mask: np.ndarray) -> np.ndarray:
+    """Single irregular polygon with sharp edges (torn-fragment look)."""
+    h, w = mask.shape[:2]
+    u8 = (mask.astype(np.uint8) * 255)
+    contours, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+    cnt = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(cnt, True)
+    eps = max(2.0, POLYGON_EPSILON_FRAC * peri)
+    approx = cv2.approxPolyDP(cnt, eps, True)
+    if len(approx) < 3:
+        return mask
+    poly = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(poly, [approx], 255)
+    return poly > 0
+
+
 def extract_cheek_tight_bone(
     bone_rgb: np.ndarray,
     clean_rgb: np.ndarray,
@@ -217,8 +285,8 @@ def extract_cheek_tight_bone(
     landmarks,
 ) -> tuple[Image.Image, str, int, dict]:
     """
-    CLIPSeg cheek prompt on clean @ 352 → ear step → mask on BONE → tight crop.
-    Returns (image, method, pixel_count, timing_dict).
+    Gemini-style fragment: CLIPSeg cheek+jaw → exclude features → ear cut →
+    largest blob only → sharp angular polygon → BONE duotone tight crop.
     """
     h, w = bone_rgb.shape[:2]
     timing: dict = {}
@@ -226,7 +294,7 @@ def extract_cheek_tight_bone(
     t0 = datetime.now(timezone.utc)
     mask = clipseg_cheek.predict_mask(clean_rgb, CLIPSEG_CHEEK_PROMPT)
     timing["clipseg_ms"] = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-    method = "clipseg_bone_tight"
+    method = "clipseg_angular_fragment_bone"
 
     if mask is None or not np.any(mask):
         method = "clipseg_fallback_alpha"
@@ -240,18 +308,27 @@ def extract_cheek_tight_bone(
             mask &= np.arange(w) <= x_cut
     else:
         t1 = datetime.now(timezone.utc)
+        mask = _exclude_eyes_nose_mouth(mask, clean_rgb, landmarks, width=w, height=h)
+        timing["exclude_features_ms"] = int(
+            (datetime.now(timezone.utc) - t1).total_seconds() * 1000
+        )
+        t2 = datetime.now(timezone.utc)
         mask = remove_ear_from_mask(mask, clean_rgb, landmarks, width=w, height=h)
         timing["ear_removal_ms"] = int(
-            (datetime.now(timezone.utc) - t1).total_seconds() * 1000
+            (datetime.now(timezone.utc) - t2).total_seconds() * 1000
         )
 
     if alpha is not None:
         mask &= _eroded_alpha_u8(alpha, h, w) > 100
 
-    # Drop speckles / holes.
     mask_u8 = (mask.astype(np.uint8) * 255)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     mask = mask_u8 > 127
+
+    t3 = datetime.now(timezone.utc)
+    mask = _keep_largest_component(mask)
+    mask = _angular_polygon_mask(mask)
+    timing["fragment_ms"] = int((datetime.now(timezone.utc) - t3).total_seconds() * 1000)
 
     if not np.any(mask):
         return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0, timing
