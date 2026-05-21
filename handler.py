@@ -93,20 +93,25 @@ def trigger_gemini_cheek_fragment(scan_id: str) -> None:
         print("[handler] skip gemini-cheek-fragment trigger (no Supabase config)")
         return
     url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/gemini-cheek-fragment"
+    # Supabase service-to-service: secret/publishable keys go on apikey, not Authorization Bearer.
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "application/json",
+    }
+    key = SUPABASE_SERVICE_KEY.strip()
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
+
     try:
         resp = requests.post(
             url,
             json={"scan_id": scan_id},
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "apikey": SUPABASE_SERVICE_KEY,
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             timeout=15,
         )
         print(
             f"[handler] gemini-cheek-fragment trigger scan_id={scan_id} "
-            f"http={resp.status_code}"
+            f"http={resp.status_code} body={resp.text[:200]}"
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[handler] gemini-cheek-fragment trigger failed: {exc}")
