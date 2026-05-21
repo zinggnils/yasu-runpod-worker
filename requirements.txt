@@ -2,6 +2,6 @@ numpy==1.26.4
 runpod
 pillow
 pillow-heif
-opencv-python-headless
+opencv-python-headless==4.10.0.84
 onnxruntime==1.17.1
 mediapipe>=0.10.14

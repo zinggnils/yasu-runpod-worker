@@ -2,13 +2,24 @@
 # inference for MODNet portrait matting. No CUDA/PyTorch needed.
 FROM python:3.11-slim
 
+# libgl1: OpenCV/mediapipe wheels may link libGL.so.1 even in serverless (no GUI).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libglib2.0-0 libgomp1 ca-certificates curl && \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    ca-certificates \
+    curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# Install headless OpenCV first, then the rest. mediapipe can otherwise pull
+# opencv-contrib-python which requires libGL at import time on slim images.
+RUN pip install --upgrade pip && \
+    pip install "opencv-python-headless==4.10.0.84" && \
+    pip install -r requirements.txt && \
+    pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless 2>/dev/null || true && \
+    pip install --force-reinstall --no-deps "opencv-python-headless==4.10.0.84"
 
 # Pre-download MODNet portrait matting weights into the image so cold-starts
 # don't pay the ~25 MB download every time. MODNet is the simple, fast
