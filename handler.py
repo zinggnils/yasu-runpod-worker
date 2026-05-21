@@ -12,8 +12,6 @@ import onnxruntime as ort
 import requests
 from PIL import Image, ImageFilter, ImageOps
 
-import gemini_fragment
-
 # Register the HEIF/HEIC opener with Pillow so Image.open() auto-detects HEIC
 # bytes (the format the iOS app uploads). Pillow's auto-detect reads the file
 # header, so no other code in this module needs to know the input format.
@@ -85,29 +83,33 @@ def _init_matting():
 MATTING_SESSION = _init_matting()
 
 # ---------------------------------------------------------------------------
-# Cheek ROI: Gemini image model on VISIA BONE map (right_90 only)
+# Phase 2 cheek fragment runs async via Supabase Edge Function (gemini-cheek-fragment)
 # ---------------------------------------------------------------------------
-GEMINI_FRAGMENT_REQUIRED = os.environ.get(
-    "GEMINI_FRAGMENT_REQUIRED", "true"
-).lower() in ("1", "true", "yes")
 
 
-def extract_cheek_gemini_fragment(visia: Image.Image) -> tuple[Image.Image, str, int, dict]:
-    """Exact product prompt on cheek-cropped VISIA → fragment PNG for Supabase."""
-    timing: dict = {}
-    t0 = datetime.now(timezone.utc)
-    fragment, err = gemini_fragment.run_gemini_fragment(visia)
-    timing["gemini_ms"] = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-    timing["gemini_model"] = gemini_fragment.GEMINI_FRAGMENT_MODEL
-
-    if fragment is None:
-        if GEMINI_FRAGMENT_REQUIRED:
-            raise RuntimeError(f"Gemini cheek fragment failed: {err}")
-        print(f"[gemini_fragment] skipped: {err}")
-        return Image.new("RGB", (1, 1), (0, 0, 0)), "gemini_fragment_skipped", 0, timing
-
-    rgb = fragment.convert("RGB")
-    return rgb, "gemini_fragment", rgb.size[0] * rgb.size[1], timing
+def trigger_gemini_cheek_fragment(scan_id: str) -> None:
+    """Fire-and-forget: edge function reads visia_image_url and calls Gemini."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("[handler] skip gemini-cheek-fragment trigger (no Supabase config)")
+        return
+    url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/gemini-cheek-fragment"
+    try:
+        resp = requests.post(
+            url,
+            json={"scan_id": scan_id},
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
+        print(
+            f"[handler] gemini-cheek-fragment trigger scan_id={scan_id} "
+            f"http={resp.status_code}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[handler] gemini-cheek-fragment trigger failed: {exc}")
 
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
@@ -778,7 +780,7 @@ def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image
 def update_supabase_scan(scan_id: str, processed_angles: dict, primary: dict) -> None:
     url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
     body = {
-        "status": "done",
+        "status": "visia_ready",
         "processed_angles": processed_angles,
         "clean_image_url": primary.get("clean_image_url"),
         "redness_image_url": primary.get("visia_image_url"),
@@ -1041,31 +1043,12 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
 
     visia = make_analysis_map(clean, mode, alpha=alpha)
 
-    cheek_preview = None
-    cheek_method = ""
-    cheek_pixels = 0
-    cheek_timing: dict = {}
     if label in ANALYSIS_ANGLES:
-        # API: cheek ROI crop only (~1000²) — full VISIA still stored below.
-        visia_api, _, crop_meta = analysis_roi_crop(visia, alpha, label)
-        cheek_timing = {"gemini_crop_method": crop_meta.get("method")}
-        print(
-            f"[handler] {label} gemini_input crop={crop_meta.get('method')} "
-            f"size={visia_api.size}"
-        )
-        cheek_preview, cheek_method, cheek_pixels, gemini_timing = (
-            extract_cheek_gemini_fragment(visia_api)
-        )
-        cheek_timing.update(gemini_timing)
-
-    if label in ANALYSIS_ANGLES:
+        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     else:
-        # Display-only angles: q=95 WebP is visually indistinguishable on
-        # skin imagery and 5-10x faster to encode than lossless.
         clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
-
-    visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
 
     angle_data: dict = {
         "original_image_url": original_url,
@@ -1075,24 +1058,14 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
         angle_data.update(
             {
-                "analysis_step": "cheek_roi",
-                "cheek_roi_method": cheek_method,
-                "cheek_roi_model": cheek_timing.get("gemini_model"),
-                "cheek_roi_image_url": cheek_url,
-                "cheek_pixel_count": cheek_pixels,
-                **cheek_timing,
+                "analysis_step": "visia_ready",
+                "cheek_fragment_status": "pending",
                 **compute_quality(clean, label),
             }
         )
-        print(
-            f"[handler] {label} cheek_roi method={cheek_method} "
-            f"model={cheek_timing.get('gemini_model')} "
-            f"gemini_ms={cheek_timing.get('gemini_ms')} "
-            f"size={cheek_preview.size}"
-        )
+        print(f"[handler] {label} visia_ready visia_url={visia_url}")
 
     print(f"[handler] {label} OK")
     return label, angle_data
@@ -1224,16 +1197,17 @@ def handler(job):
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary)
+        trigger_gemini_cheek_fragment(scan_id)
         print(
-            f"[handler] DB updated OK for scan_id={scan_id} "
-            f"prep_only angles={list(ANALYSIS_ANGLES)}"
+            f"[handler] DB visia_ready scan_id={scan_id} "
+            f"triggered gemini-cheek-fragment"
         )
 
     return {
-        "status": "done",
+        "status": "visia_ready",
         "scan_id": scan_id,
         "analysis_angles": list(ANALYSIS_ANGLES),
-        "analysis_step": primary.get("analysis_step", "prep_only"),
+        "analysis_step": primary.get("analysis_step", "visia_ready"),
         "processed_angles": processed_angles,
     }
 

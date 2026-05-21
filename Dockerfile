@@ -21,5 +21,5 @@ RUN mkdir -p /root/.modnet && \
     curl -fL https://github.com/yakhyo/modnet/releases/download/weights/modnet_photographic.onnx \
       -o /root/.modnet/modnet_photographic.onnx
 
-COPY gemini_fragment.py handler.py .
+COPY handler.py .
 CMD ["python", "-u", "handler.py"]

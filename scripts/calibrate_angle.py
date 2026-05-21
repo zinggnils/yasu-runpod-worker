@@ -29,6 +29,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import gemini_fragment
 import handler  # noqa: E402
 
 
@@ -59,18 +60,18 @@ def main() -> None:
     crop = handler.fixed_analysis_crop(clean)
     crop.save(out_dir / "05_center_crop_1000.jpg", quality=95)
 
-    cheek_img, cheek_method, cheek_pixels, cheek_timing = handler.extract_cheek_gemini_fragment(
-        visia
-    )
+    cheek_img, err = gemini_fragment.run_gemini_fragment(visia)
+    if cheek_img is None:
+        raise SystemExit(f"Gemini fragment failed: {err}")
     cheek_img.save(out_dir / "07_cheek_gemini_fragment.png", quality=95)
 
     prep = {
         "angle": args.angle,
         "analysis_step": "cheek_roi",
-        "cheek_roi_method": cheek_method,
-        "cheek_pixel_count": cheek_pixels,
-        "cheek_timing": cheek_timing,
-        "gemini_model": cheek_timing.get("gemini_model"),
+        "cheek_roi_method": "gemini_fragment",
+        "cheek_pixel_count": cheek_img.size[0] * cheek_img.size[1],
+        "gemini_model": gemini_fragment.GEMINI_FRAGMENT_MODEL,
+        "gemini_error": err,
         "matting": alpha is not None,
         **handler.compute_quality(clean, args.angle),
         "face_bbox": list(handler.detect_face_bbox(clean, args.angle) or ()),

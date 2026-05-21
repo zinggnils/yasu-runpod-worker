@@ -1,17 +1,13 @@
-"""Gemini image model — cheek/jaw fragment from VISIA BONE map (Nano Banana family)."""
+"""Gemini cheek fragment — used by calibrate script; production runs in Edge Function."""
 
 from __future__ import annotations
 
-import logging
 import os
 from io import BytesIO
 
 import cv2
 import numpy as np
 from PIL import Image
-
-logging.getLogger("google_genai").setLevel(logging.WARNING)
-logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 
 GEMINI_FRAGMENT_PROMPT = """Deconstruct the portrait into fragmented, isolated skin texture pieces.
 Extract only the cheek and jaw area as a single irregular polygon shape —
@@ -23,19 +19,14 @@ lastly remove all shapes but the biggest one completely from the picture
 IMPORTANT: Final check, if there are still any Parts of the eye, mouth, nose, ear to See remove from Fragment"""
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-# 2.5 Flash Image is much faster than 3.1 preview for API (~15–25s vs 60–120s+).
-# Set GEMINI_FRAGMENT_MODEL=gemini-3.1-flash-image-preview for max quality (slower).
 GEMINI_FRAGMENT_MODEL = os.environ.get(
     "GEMINI_FRAGMENT_MODEL", "gemini-2.5-flash-image"
 )
-# API-only cap after cheek crop (stored VISIA in Supabase stays full-res JPEG).
-GEMINI_FRAGMENT_MAX_EDGE = int(os.environ.get("GEMINI_FRAGMENT_MAX_EDGE", "1024"))
-GEMINI_FRAGMENT_JPEG_QUALITY = int(os.environ.get("GEMINI_FRAGMENT_JPEG_QUALITY", "92"))
-GEMINI_FRAGMENT_TIMEOUT_S = int(os.environ.get("GEMINI_FRAGMENT_TIMEOUT_S", "90"))
+GEMINI_FRAGMENT_IMAGE_SIZE = os.environ.get("GEMINI_FRAGMENT_IMAGE_SIZE", "1K")
+GEMINI_FRAGMENT_TIMEOUT_S = int(os.environ.get("GEMINI_FRAGMENT_TIMEOUT_S", "150"))
 
 
 def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:
-    """Drop smaller blobs so only the biggest cheek cutout remains on black."""
     arr = np.array(rgb)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     _, fg = cv2.threshold(gray, 12, 255, cv2.THRESH_BINARY)
@@ -52,36 +43,8 @@ def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:
     return Image.fromarray(out, mode="RGB")
 
 
-def _prepare_input(img: Image.Image) -> Image.Image:
-    rgb = img.convert("RGB")
-    if GEMINI_FRAGMENT_MAX_EDGE <= 0:
-        return rgb
-    w, h = rgb.size
-    edge = max(w, h)
-    if edge <= GEMINI_FRAGMENT_MAX_EDGE:
-        return rgb
-    scale = GEMINI_FRAGMENT_MAX_EDGE / float(edge)
-    return rgb.resize(
-        (max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS
-    )
-
-
-def _api_jpeg_bytes(img: Image.Image) -> bytes:
-    buf = BytesIO()
-    img.save(
-        buf,
-        format="JPEG",
-        quality=GEMINI_FRAGMENT_JPEG_QUALITY,
-        optimize=True,
-    )
-    return buf.getvalue()
-
-
-def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | None]:
-    """
-    Send cheek-cropped VISIA (caller should pass ~1000×1000) + prompt to Gemini.
-    Full-resolution VISIA for storage is handled separately in handler.
-    """
+def run_gemini_fragment_from_url(visia_url: str) -> tuple[Image.Image | None, str | None]:
+    """VISIA by public URL (file_uri) + 1K output cap — mirrors edge function."""
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY not set"
 
@@ -91,37 +54,26 @@ def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | N
     except ImportError as exc:
         return None, f"google-genai not installed: {exc}"
 
-    prepared = _prepare_input(visia)
-    jpeg = _api_jpeg_bytes(prepared)
-
     http_options = types.HttpOptions(timeout=GEMINI_FRAGMENT_TIMEOUT_S * 1000)
     client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
 
     config = types.GenerateContentConfig(
         response_modalities=["IMAGE"],
         temperature=0.4,
-    )
-
-    print(
-        f"[gemini_fragment] request model={GEMINI_FRAGMENT_MODEL} "
-        f"in={visia.size} api={prepared.size} jpeg_kb={len(jpeg) // 1024} "
-        f"timeout_s={GEMINI_FRAGMENT_TIMEOUT_S}"
+        image_config=types.ImageConfig(image_size=GEMINI_FRAGMENT_IMAGE_SIZE),
     )
 
     try:
         response = client.models.generate_content(
             model=GEMINI_FRAGMENT_MODEL,
             contents=[
-                types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"),
+                types.Part.from_uri(file_uri=visia_url, mime_type="image/jpeg"),
                 GEMINI_FRAGMENT_PROMPT,
             ],
             config=config,
         )
     except Exception as exc:  # noqa: BLE001
-        print(f"[gemini_fragment] failed: {exc}")
         return None, f"Gemini API error: {exc}"
-
-    print("[gemini_fragment] response received")
 
     if not response.candidates:
         return None, "Gemini returned no candidates"
@@ -139,3 +91,45 @@ def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | N
             pass
 
     return None, "Gemini response had no image part"
+
+
+def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | None]:
+    """Local file path: upload bytes inline (calibrate only)."""
+    if not GEMINI_API_KEY:
+        return None, "GEMINI_API_KEY not set"
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        return None, f"google-genai not installed: {exc}"
+
+    buf = BytesIO()
+    visia.convert("RGB").save(buf, format="JPEG", quality=92, optimize=True)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        temperature=0.4,
+        image_config=types.ImageConfig(image_size=GEMINI_FRAGMENT_IMAGE_SIZE),
+    )
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_FRAGMENT_MODEL,
+            contents=[
+                types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
+                GEMINI_FRAGMENT_PROMPT,
+            ],
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Gemini API error: {exc}"
+
+    if not response.candidates:
+        return None, "no candidates"
+    for part in response.candidates[0].content.parts:
+        inline = getattr(part, "inline_data", None)
+        if inline is not None and inline.data:
+            return _keep_largest_fragment(
+                Image.open(BytesIO(inline.data)).convert("RGB")
+            ), None
+    return None, "no image part"
