@@ -12,7 +12,7 @@ import onnxruntime as ort
 import requests
 from PIL import Image, ImageFilter, ImageOps
 
-import clipseg_cheek
+import gemini_fragment
 
 # Register the HEIF/HEIC opener with Pillow so Image.open() auto-detects HEIC
 # bytes (the format the iOS app uploads). Pillow's auto-detect reads the file
@@ -85,266 +85,29 @@ def _init_matting():
 MATTING_SESSION = _init_matting()
 
 # ---------------------------------------------------------------------------
-# Cheek ROI: CLIPSeg text prompt @ 352px → ear removal → BONE tight crop
+# Cheek ROI: Gemini image model on VISIA BONE map (right_90 only)
 # ---------------------------------------------------------------------------
-FACE_LANDMARKER_PATH = os.environ.get(
-    "FACE_LANDMARKER_PATH", "/root/.mediapipe/face_landmarker.task"
-)
-LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "960"))
-CHEEK_TIGHT_PADDING = int(os.environ.get("CHEEK_TIGHT_PADDING", "24"))
-CLIPSEG_CHEEK_PROMPT = os.environ.get(
-    "CLIPSEG_CHEEK_PROMPT", "cheek and jaw skin texture"
-)
-CLIPSEG_EAR_PROMPT = os.environ.get("CLIPSEG_EAR_PROMPT", "ear")
-CLIPSEG_EAR_THRESHOLD = float(os.environ.get("CLIPSEG_EAR_THRESHOLD", "0.35"))
-# Subtract eye/nose/mouth blobs (comma-separated CLIPSeg prompts).
-CLIPSEG_EXCLUDE_PROMPTS = os.environ.get("CLIPSEG_EXCLUDE_PROMPTS", "eye,nose,mouth")
-CLIPSEG_EXCLUDE_THRESHOLD = float(os.environ.get("CLIPSEG_EXCLUDE_THRESHOLD", "0.38"))
-# Profile ear strip: keep left fraction of cheek mask span (right_90).
-PROFILE_EAR_X_KEEP = float(os.environ.get("PROFILE_EAR_X_KEEP", "0.68"))
-# Sharp angular polygon from largest fragment (lower = more corners).
-POLYGON_EPSILON_FRAC = float(os.environ.get("POLYGON_EPSILON_FRAC", "0.014"))
-
-# Warm CLIPSeg weights at import (long first cold start moved to image build).
-clipseg_cheek._load()
+GEMINI_FRAGMENT_REQUIRED = os.environ.get(
+    "GEMINI_FRAGMENT_REQUIRED", "true"
+).lower() in ("1", "true", "yes")
 
 
-def _init_face_landmarker():
-    model_path = Path(FACE_LANDMARKER_PATH)
-    if not model_path.exists() or model_path.stat().st_size == 0:
-        print(f"[landmarks] model not found at {model_path}; cheek ROI uses alpha fallback")
-        return None
-    try:
-        import mediapipe as mp
-        from mediapipe.tasks.python import vision
-        from mediapipe.tasks.python.core import base_options as mp_base
-
-        opts = vision.FaceLandmarkerOptions(
-            base_options=mp_base.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.IMAGE,
-            num_faces=1,
-        )
-        landmarker = vision.FaceLandmarker.create_from_options(opts)
-        print("[landmarks] FaceLandmarker session OK")
-        return landmarker
-    except Exception as exc:  # noqa: BLE001
-        print(f"[landmarks] init failed: {exc}")
-        return None
-
-
-FACE_LANDMARKER = _init_face_landmarker()
-_MP_IMAGE_FORMAT = None
-
-
-def _mp_image(rgb: np.ndarray):
-    global _MP_IMAGE_FORMAT
-    import mediapipe as mp
-
-    if _MP_IMAGE_FORMAT is None:
-        _MP_IMAGE_FORMAT = mp.ImageFormat.SRGB
-    return mp.Image(image_format=_MP_IMAGE_FORMAT, data=np.ascontiguousarray(rgb))
-
-
-def detect_face_landmarks(rgb: np.ndarray):
-    """478 landmarks in full-image pixel coords, or None."""
-    if FACE_LANDMARKER is None:
-        return None
-    h, w = rgb.shape[:2]
-    scale = LANDMARK_LONG_EDGE / float(max(h, w))
-    if scale < 1.0:
-        nw = max(1, int(round(w * scale)))
-        nh = max(1, int(round(h * scale)))
-        small = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-    else:
-        small = rgb
-    try:
-        result = FACE_LANDMARKER.detect(_mp_image(small))
-    except Exception as exc:  # noqa: BLE001
-        print(f"[landmarks] detect failed: {exc}")
-        return None
-    if not result.face_landmarks:
-        return None
-    return result.face_landmarks[0]
-
-
-def _eroded_alpha_u8(alpha: np.ndarray, h: int, w: int) -> np.ndarray:
-    erode_px = max(12, int(min(h, w) * 0.04))
-    return cv2.erode(
-        alpha.astype(np.uint8),
-        np.ones((erode_px, erode_px), np.uint8),
-        iterations=1,
-    )
-
-
-def remove_ear_from_mask(
-    mask: np.ndarray,
-    clean_rgb: np.ndarray,
-    landmarks,
-    *,
-    width: int,
-    height: int,
-) -> np.ndarray:
-    """Step 2: subtract ear CLIPSeg + profile geometry + chin cap."""
-    h, w = height, width
-    out = mask.copy()
-
-    # Text prompt: remove ear pixels CLIPSeg finds.
-    ear_mask = clipseg_cheek.predict_mask(
-        clean_rgb, CLIPSEG_EAR_PROMPT, threshold=CLIPSEG_EAR_THRESHOLD
-    )
-    if ear_mask is not None:
-        out &= ~ear_mask
-
-    # right_90 profile: ear sits on the high-x side of the face span.
-    if np.any(out):
-        cols = np.where(np.any(out, axis=0))[0]
-        if cols.size:
-            x_cut = int(cols[0] + (cols[-1] - cols[0]) * PROFILE_EAR_X_KEEP)
-            out &= np.arange(w, dtype=np.int32) <= x_cut
-
-    if landmarks is not None and len(landmarks) > 152:
-        chin_y = int(landmarks[152].y * h) + int(0.04 * h)
-        out[chin_y:, :] = False
-        out_u8 = (out.astype(np.uint8) * 255)
-        for ear_idx in (454, 361, 288, 234):
-            if ear_idx < len(landmarks):
-                ex = int(landmarks[ear_idx].x * w)
-                ey = int(landmarks[ear_idx].y * h)
-                r = max(12, int(0.05 * min(w, h)))
-                cv2.circle(out_u8, (ex, ey), r, 0, -1)
-        out = out_u8 > 127
-
-    return out.astype(bool)
-
-
-def _exclude_eyes_nose_mouth(
-    mask: np.ndarray,
-    clean_rgb: np.ndarray,
-    landmarks,
-    *,
-    width: int,
-    height: int,
-) -> np.ndarray:
-    """Remove eyes, nose, mouth via CLIPSeg subtract + landmark caps."""
-    h, w = height, width
-    out = mask.copy()
-    for prompt in [p.strip() for p in CLIPSEG_EXCLUDE_PROMPTS.split(",") if p.strip()]:
-        ex = clipseg_cheek.predict_mask(
-            clean_rgb, prompt, threshold=CLIPSEG_EXCLUDE_THRESHOLD
-        )
-        if ex is not None:
-            out &= ~ex
-
-    if landmarks is not None:
-        eye_ids = (33, 133, 159, 145, 263, 362, 386, 374, 249, 390)
-        eye_ys = [landmarks[i].y * h for i in eye_ids if i < len(landmarks)]
-        if eye_ys:
-            out[: int(max(eye_ys) + 0.02 * h), :] = False
-        if len(landmarks) > 1:
-            nx = int(landmarks[1].x * w)
-            band = int(0.07 * w)
-            out[:, max(0, nx - band) : min(w, nx + band)] = False
-    return out.astype(bool)
-
-
-def _keep_largest_component(mask: np.ndarray) -> np.ndarray:
-    """Keep only the biggest connected region (drop all smaller fragments)."""
-    u8 = (mask.astype(np.uint8) * 255)
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
-    if n_labels <= 1:
-        return mask
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    if areas.size == 0:
-        return mask
-    best = 1 + int(np.argmax(areas))
-    return labels == best
-
-
-def _angular_polygon_mask(mask: np.ndarray) -> np.ndarray:
-    """Single irregular polygon with sharp edges (torn-fragment look)."""
-    h, w = mask.shape[:2]
-    u8 = (mask.astype(np.uint8) * 255)
-    contours, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return mask
-    cnt = max(contours, key=cv2.contourArea)
-    peri = cv2.arcLength(cnt, True)
-    eps = max(2.0, POLYGON_EPSILON_FRAC * peri)
-    approx = cv2.approxPolyDP(cnt, eps, True)
-    if len(approx) < 3:
-        return mask
-    poly = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(poly, [approx], 255)
-    return poly > 0
-
-
-def extract_cheek_tight_bone(
-    bone_rgb: np.ndarray,
-    clean_rgb: np.ndarray,
-    alpha: np.ndarray | None,
-    landmarks,
-) -> tuple[Image.Image, str, int, dict]:
-    """
-    Gemini-style fragment: CLIPSeg cheek+jaw → exclude features → ear cut →
-    largest blob only → sharp angular polygon → BONE duotone tight crop.
-    """
-    h, w = bone_rgb.shape[:2]
+def extract_cheek_gemini_fragment(visia: Image.Image) -> tuple[Image.Image, str, int, dict]:
+    """Exact product prompt on VISIA → fragment PNG for Supabase."""
     timing: dict = {}
-
     t0 = datetime.now(timezone.utc)
-    mask = clipseg_cheek.predict_mask(clean_rgb, CLIPSEG_CHEEK_PROMPT)
-    timing["clipseg_ms"] = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
-    method = "clipseg_angular_fragment_bone"
+    fragment, err = gemini_fragment.run_gemini_fragment(visia)
+    timing["gemini_ms"] = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+    timing["gemini_model"] = gemini_fragment.GEMINI_FRAGMENT_MODEL
 
-    if mask is None or not np.any(mask):
-        method = "clipseg_fallback_alpha"
-        if alpha is None:
-            return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0, timing
-        eroded = _eroded_alpha_u8(alpha, h, w)
-        mask = eroded > 100
-        cols = np.where(np.any(mask, axis=0))[0]
-        if cols.size:
-            x_cut = int(cols[0] + (cols[-1] - cols[0]) * PROFILE_EAR_X_KEEP)
-            mask &= np.arange(w) <= x_cut
-    else:
-        t1 = datetime.now(timezone.utc)
-        mask = _exclude_eyes_nose_mouth(mask, clean_rgb, landmarks, width=w, height=h)
-        timing["exclude_features_ms"] = int(
-            (datetime.now(timezone.utc) - t1).total_seconds() * 1000
-        )
-        t2 = datetime.now(timezone.utc)
-        mask = remove_ear_from_mask(mask, clean_rgb, landmarks, width=w, height=h)
-        timing["ear_removal_ms"] = int(
-            (datetime.now(timezone.utc) - t2).total_seconds() * 1000
-        )
+    if fragment is None:
+        if GEMINI_FRAGMENT_REQUIRED:
+            raise RuntimeError(f"Gemini cheek fragment failed: {err}")
+        print(f"[gemini_fragment] skipped: {err}")
+        return Image.new("RGB", (1, 1), (0, 0, 0)), "gemini_fragment_skipped", 0, timing
 
-    if alpha is not None:
-        mask &= _eroded_alpha_u8(alpha, h, w) > 100
-
-    mask_u8 = (mask.astype(np.uint8) * 255)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    mask = mask_u8 > 127
-
-    t3 = datetime.now(timezone.utc)
-    mask = _keep_largest_component(mask)
-    mask = _angular_polygon_mask(mask)
-    timing["fragment_ms"] = int((datetime.now(timezone.utc) - t3).total_seconds() * 1000)
-
-    if not np.any(mask):
-        return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0, timing
-
-    ys, xs = np.where(mask)
-    pad = CHEEK_TIGHT_PADDING
-    x1 = max(0, int(xs.min()) - pad)
-    y1 = max(0, int(ys.min()) - pad)
-    x2 = min(w, int(xs.max()) + pad + 1)
-    y2 = min(h, int(ys.max()) + pad + 1)
-
-    crop = bone_rgb[y1:y2, x1:x2].copy()
-    mask_crop = mask[y1:y2, x1:x2]
-    crop[~mask_crop] = 0
-    pixels = int(mask_crop.sum())
-    return Image.fromarray(crop, mode="RGB"), method, pixels, timing
+    rgb = fragment.convert("RGB")
+    return rgb, "gemini_fragment", rgb.size[0] * rgb.size[1], timing
 
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
@@ -1295,34 +1058,26 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        rgb = np.array(clean.convert("RGB"))
-        bone_rgb = np.array(visia.convert("RGB"))
-        t_lm = datetime.now(timezone.utc)
-        landmarks = detect_face_landmarks(rgb)
-        cheek_preview, cheek_method, cheek_pixels, cheek_timing = extract_cheek_tight_bone(
-            bone_rgb, rgb, alpha, landmarks
+        cheek_preview, cheek_method, cheek_pixels, cheek_timing = (
+            extract_cheek_gemini_fragment(visia)
         )
         cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
-        lm_ms = int(
-            (datetime.now(timezone.utc) - t_lm).total_seconds() * 1000
-        )
         angle_data.update(
             {
                 "analysis_step": "cheek_roi",
                 "cheek_roi_method": cheek_method,
-                "cheek_roi_prompt": CLIPSEG_CHEEK_PROMPT,
+                "cheek_roi_model": cheek_timing.get("gemini_model"),
                 "cheek_roi_image_url": cheek_url,
                 "cheek_pixel_count": cheek_pixels,
-                "landmark_ms": lm_ms,
                 **cheek_timing,
                 **compute_quality(clean, label),
             }
         )
         print(
             f"[handler] {label} cheek_roi method={cheek_method} "
-            f"prompt={CLIPSEG_CHEEK_PROMPT!r} pixels={cheek_pixels} "
-            f"timing={cheek_timing} landmark_ms={lm_ms} "
-            f"clipseg_ready={clipseg_cheek.clipseg_ready()}"
+            f"model={cheek_timing.get('gemini_model')} "
+            f"gemini_ms={cheek_timing.get('gemini_ms')} "
+            f"size={cheek_preview.size}"
         )
 
     print(f"[handler] {label} OK")

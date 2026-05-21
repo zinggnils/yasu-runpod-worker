@@ -59,13 +59,10 @@ def main() -> None:
     crop = handler.fixed_analysis_crop(clean)
     crop.save(out_dir / "05_center_crop_1000.jpg", quality=95)
 
-    rgb = np.array(clean.convert("RGB"))
-    bone_rgb = np.array(visia.convert("RGB"))
-    landmarks = handler.detect_face_landmarks(rgb)
-    cheek_img, cheek_method, cheek_pixels, cheek_timing = handler.extract_cheek_tight_bone(
-        bone_rgb, rgb, alpha, landmarks
+    cheek_img, cheek_method, cheek_pixels, cheek_timing = handler.extract_cheek_gemini_fragment(
+        visia
     )
-    cheek_img.save(out_dir / "07_cheek_bone_tight.png", quality=95)
+    cheek_img.save(out_dir / "07_cheek_gemini_fragment.png", quality=95)
 
     prep = {
         "angle": args.angle,
@@ -73,7 +70,7 @@ def main() -> None:
         "cheek_roi_method": cheek_method,
         "cheek_pixel_count": cheek_pixels,
         "cheek_timing": cheek_timing,
-        "landmarks_detected": landmarks is not None,
+        "gemini_model": cheek_timing.get("gemini_model"),
         "matting": alpha is not None,
         **handler.compute_quality(clean, args.angle),
         "face_bbox": list(handler.detect_face_bbox(clean, args.angle) or ()),
