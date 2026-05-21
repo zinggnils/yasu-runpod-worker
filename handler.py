@@ -82,99 +82,6 @@ def _init_matting():
 
 MATTING_SESSION = _init_matting()
 
-# ---------------------------------------------------------------------------
-# BiSeNet face parsing (CelebAMask-style) — cheek ROI for right_90 scoring
-# ---------------------------------------------------------------------------
-FACE_PARSE_MODEL_PATH = os.environ.get(
-    "FACE_PARSE_MODEL_PATH", "/root/.face-parse/resnet18.onnx"
-)
-FACE_PARSE_INPUT_SIZE = (512, 512)
-# Lab erythema index above per-face baseline (a* units) counts as "red".
-REDNESS_EI_THRESHOLD = float(os.environ.get("REDNESS_EI_THRESHOLD", "8.0"))
-# yakhyo/face-parsing class indices (1-based in ATTRIBUTES list).
-_PARSE_SKIN = 1
-_PARSE_EARS = {7, 8, 9}  # l_ear, r_ear, ear_r
-
-
-def _init_face_parse():
-    model_path = Path(FACE_PARSE_MODEL_PATH)
-    if not model_path.exists() or model_path.stat().st_size == 0:
-        print(f"[face_parse] model not found at {model_path}; cheek mask falls back to eroded alpha")
-        return None
-    try:
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = max(1, (os.cpu_count() or 4) // 2)
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess = ort.InferenceSession(
-            str(model_path), opts, providers=["CPUExecutionProvider"]
-        )
-        print(f"[face_parse] session OK providers={sess.get_providers()}")
-        return sess
-    except Exception as exc:  # noqa: BLE001
-        print(f"[face_parse] init failed: {exc}")
-        return None
-
-
-FACE_PARSE_SESSION = _init_face_parse()
-_FACE_PARSE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_FACE_PARSE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-
-def predict_face_parse_mask(rgb: np.ndarray) -> np.ndarray | None:
-    """Semantic labels (H,W) uint8 at full resolution, or None if parser disabled."""
-    if FACE_PARSE_SESSION is None:
-        return None
-    h, w = rgb.shape[:2]
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    resized = cv2.resize(bgr, FACE_PARSE_INPUT_SIZE, interpolation=cv2.INTER_LINEAR)
-    img = resized.astype(np.float32) / 255.0
-    img = (img - _FACE_PARSE_MEAN) / _FACE_PARSE_STD
-    chw = np.transpose(img, (2, 0, 1))[None, ...].astype(np.float32)
-    inp = FACE_PARSE_SESSION.get_inputs()[0].name
-    out = FACE_PARSE_SESSION.run(None, {inp: chw})[0]
-    labels = out.squeeze(0).argmax(0).astype(np.uint8)
-    return cv2.resize(labels, (w, h), interpolation=cv2.INTER_NEAREST)
-
-
-def cheek_mask_for_angle(
-    rgb: np.ndarray,
-    alpha_u8: np.ndarray | None,
-    parse_mask: np.ndarray | None,
-    label: str,
-) -> tuple[np.ndarray, str]:
-    """Cheek-only boolean mask for scoring + overlay."""
-    h, w = rgb.shape[:2]
-    if parse_mask is not None:
-        cheek = parse_mask == _PARSE_SKIN
-        for ear_cls in _PARSE_EARS:
-            cheek &= parse_mask != ear_cls
-        method = "bisenet_cheek"
-    else:
-        cheek = np.zeros((h, w), dtype=bool)
-        method = "erode_fallback"
-
-    if alpha_u8 is not None:
-        erode_px = max(15, int(min(h, w) * 0.04))
-        eroded = cv2.erode(
-            alpha_u8, np.ones((erode_px, erode_px), np.uint8), iterations=1
-        )
-        cheek &= eroded > 100
-    cheek &= _brightness(rgb) > 0.18
-
-    if label == "right_90" and np.any(cheek):
-        # Profile: drop rightmost skin strip (patient's ear / edge blob).
-        xs = np.arange(w, dtype=np.float32)
-        x_cut = float(np.percentile(xs[np.any(cheek, axis=0)], 88))
-        cheek &= xs <= x_cut
-
-    if not np.any(cheek):
-        cheek = inner_skin_mask(
-            rgb, alpha_u8 if alpha_u8 is not None else np.full((h, w), 255, np.uint8)
-        )
-        method = "erode_fallback"
-
-    return cheek, method
-
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
     """Resize to MODNET_INPUT_SIZE long edge, with both sides multiples of
@@ -812,151 +719,8 @@ def make_analysis_map(
     return Image.fromarray(rgb)
 
 
-def _rgb_and_alpha(
-    clean: Image.Image, alpha: np.ndarray | None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """RGB uint8 (H,W,3), alpha float [0,1], alpha uint8 for erosion."""
-    rgb = np.array(clean.convert("RGB"))
-    h, w = rgb.shape[:2]
-    if alpha is None:
-        return rgb, np.ones((h, w), dtype=np.float32), np.full((h, w), 255, dtype=np.uint8)
-    alpha_u8 = alpha.astype(np.uint8)
-    return rgb, alpha_u8.astype(np.float32) / 255.0, alpha_u8
-
-
-def _brightness(rgb: np.ndarray) -> np.ndarray:
-    return (
-        0.2126 * rgb[..., 0].astype(np.float32)
-        + 0.7152 * rgb[..., 1].astype(np.float32)
-        + 0.0722 * rgb[..., 2].astype(np.float32)
-    ) / 255.0
-
-
-def inner_skin_mask(
-    rgb: np.ndarray,
-    alpha_u8: np.ndarray,
-    *,
-    brightness_min: float = 0.18,
-    erode_frac: float = 0.04,
-) -> np.ndarray:
-    """Eroded matte + brightness gate — excludes ears, hair halo, background."""
-    h, w = alpha_u8.shape
-    erode_px = max(15, int(min(h, w) * erode_frac))
-    eroded = cv2.erode(
-        alpha_u8, np.ones((erode_px, erode_px), np.uint8), iterations=1
-    )
-    return (eroded > 100) & (_brightness(rgb) > brightness_min)
-
-
-def compute_redness_score_ita(
-    clean: Image.Image, alpha: np.ndarray | None = None
-) -> int:
-    """ITA-style erythema 0–100 on full portrait: median a* baseline, top erythema pixels."""
-    rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
-    skin_mask = inner_skin_mask(rgb, alpha_u8, brightness_min=0.18)
-    if not np.any(skin_mask):
-        return 0
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    a_star = lab[..., 1] - 128.0
-    baseline = float(np.median(a_star[skin_mask]))
-    ei = np.clip(a_star - baseline, 0, None)
-    ei_max = float(np.percentile(ei[skin_mask], 98))
-    ei_n = np.clip(ei / (ei_max + 1e-6), 0.0, 1.0)
-
-    face_skin = skin_mask & (alpha_f > 0.2)
-    if not np.any(face_skin):
-        return 0
-
-    rn = ei_n[face_skin]
-    p75 = float(np.percentile(rn, 75))
-    hot = rn[rn >= max(p75, 0.01)]
-    if hot.size == 0:
-        return 0
-    return int(min(100, round(float(hot.mean()) * 100)))
-
-
-def compute_redness_score_cheek(
-    clean: Image.Image,
-    alpha: np.ndarray | None,
-    cheek_mask: np.ndarray,
-) -> int:
-    """% of cheek pixels with erythema index above threshold (scale-invariant)."""
-    rgb, alpha_f, _ = _rgb_and_alpha(clean, alpha)
-    mask = cheek_mask & (alpha_f > 0.2)
-    if not np.any(mask):
-        return 0
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    a_star = lab[..., 1] - 128.0
-    baseline = float(np.median(a_star[mask]))
-    ei = a_star - baseline
-    pct = float(np.mean(ei[mask] > REDNESS_EI_THRESHOLD))
-    return int(min(100, round(pct * 100)))
-
-
-def compute_redness_overlay(
-    clean: Image.Image,
-    alpha: np.ndarray | None = None,
-    cheek_mask: np.ndarray | None = None,
-) -> Image.Image:
-    """Neon cyan on elevated redness inside cheek_mask. Returns RGBA overlay."""
-    rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
-    h, w = alpha_f.shape
-    r = rgb[..., 0].astype(np.float32)
-    g = rgb[..., 1].astype(np.float32)
-    b = rgb[..., 2].astype(np.float32)
-    redness = r - (g + b) / 2.0
-    brightness = _brightness(rgb)
-
-    if cheek_mask is not None and np.any(cheek_mask):
-        skin_mask = cheek_mask
-    else:
-        skin_mask = inner_skin_mask(rgb, alpha_u8, brightness_min=0.24)
-    if not np.any(skin_mask):
-        return Image.new("RGBA", (w, h), (0, 0, 0, 0))
-
-    lo, hi = np.percentile(redness[skin_mask], [60, 98])
-    redness_n = np.clip((redness - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-    mask = redness_n * alpha_f
-    mask *= np.where(skin_mask, 1.0, 0.0)
-    mask *= np.clip((brightness - 0.15) / 0.85, 0.0, 1.0)
-    mask = np.clip((mask - 0.25) / 0.75, 0.0, 1.0)
-
-    mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
-    mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=6))
-    mask_arr = np.array(mask_img)
-
-    neon = np.zeros((h, w, 4), dtype=np.uint8)
-    neon[..., 0] = 40
-    neon[..., 1] = 220
-    neon[..., 2] = 255
-    neon[..., 3] = mask_arr
-    return Image.fromarray(neon, mode="RGBA")
-
-
-def apply_redness_overlay(clean: Image.Image, overlay_rgba: Image.Image) -> Image.Image:
-    base = clean.convert("RGB").convert("RGBA")
-    return Image.alpha_composite(base, overlay_rgba).convert("RGB")
-
-
-def compute_white_score(clean: Image.Image, alpha: np.ndarray | None = None) -> int:
-    rgb, alpha_f, alpha_u8 = _rgb_and_alpha(clean, alpha)
-    mask = inner_skin_mask(rgb, alpha_u8) & (alpha_f > 0.2)
-    if not np.any(mask):
-        return 0
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lightness = lab[..., 0] * (100.0 / 255.0)
-    a_star = lab[..., 1] - 128.0
-    b_star = lab[..., 2] - 128.0
-    chroma = np.sqrt(a_star * a_star + b_star * b_star)
-    white = (lightness > 72.0) & (chroma < 16.0) & mask
-    return int(round(float(white.sum()) / float(mask.sum()) * 100))
-
-
 def compute_quality(clean: Image.Image, label: str = "analysis") -> dict:
-    gray = cv2.cvtColor(np.array(crop.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    gray = cv2.cvtColor(np.array(clean.convert("RGB")), cv2.COLOR_RGB2GRAY)
     blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     contrast = float(gray.std())
     mean = float(gray.mean())
@@ -975,19 +739,6 @@ def compute_quality(clean: Image.Image, label: str = "analysis") -> dict:
     return {"quality_score": quality, "quality_warnings": warnings}
 
 
-def average_analysis_redness(processed_angles: dict) -> int:
-    """Mean redness score across analysis angles present in this scan."""
-    scores: list[int] = []
-    for label in ANALYSIS_ANGLES:
-        data = processed_angles.get(label) or {}
-        raw = data.get("redness_score")
-        if raw is not None:
-            scores.append(int(raw))
-    if not scores:
-        return 0
-    return int(round(sum(scores) / len(scores)))
-
-
 def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image.Image | None, str | None]:
     if image_paths.get(label):
         path = image_paths[label]
@@ -999,15 +750,13 @@ def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image
 
 def update_supabase_scan(scan_id: str, processed_angles: dict, primary: dict) -> None:
     url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
-    redness_severity = average_analysis_redness(processed_angles)
     body = {
         "status": "done",
         "processed_angles": processed_angles,
         "clean_image_url": primary.get("clean_image_url"),
-        "redness_image_url": primary.get("redness_image_url")
-        or primary.get("visia_image_url"),
+        "redness_image_url": primary.get("visia_image_url"),
         "image_url": primary.get("visia_image_url"),
-        "redness_severity": redness_severity,
+        "redness_severity": None,
     }
     resp = requests.patch(
         url,
@@ -1226,12 +975,12 @@ def update_supabase_processed_angle(
     merged = dict(processed_angles)
     merged[label] = angle_data
     primary = merged.get(PRIMARY_ANALYSIS_ANGLE, {})
-    redness_severity = average_analysis_redness(merged)
     body = {
         "processed_angles": merged,
         "clean_image_url": primary.get("clean_image_url"),
-        "redness_image_url": primary.get("redness_image_url"),
-        "redness_severity": redness_severity,
+        "redness_image_url": primary.get("visia_image_url")
+        or primary.get("redness_image_url"),
+        "redness_severity": None,
         "studio_angles": None,
         "studio_image_url": None,
     }
@@ -1282,31 +1031,14 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        rgb = np.array(clean.convert("RGB"))
-        alpha_u8 = alpha.astype(np.uint8) if alpha is not None else None
-        parse_mask = predict_face_parse_mask(rgb)
-        cheek_mask, mask_method = cheek_mask_for_angle(
-            rgb, alpha_u8, parse_mask, label
-        )
-        overlay = compute_redness_overlay(clean, alpha, cheek_mask=cheek_mask)
-        redness_on_clean = apply_redness_overlay(clean, overlay)
-        redness_url = upload_png(redness_on_clean, f"redness_{label}_{uid}.png")
-        score = compute_redness_score_cheek(clean, alpha, cheek_mask)
         angle_data.update(
             {
-                "redness_image_url": redness_url,
-                "redness_score": score,
-                "white_score": compute_white_score(clean, alpha),
-                "scoring_method": f"{mask_method}_pct_ei",
-                "cheek_pixel_count": int(cheek_mask.sum()),
+                "analysis_step": "prep_only",
                 **compute_quality(clean, label),
             }
         )
 
-    print(
-        f"[handler] {label} OK"
-        + (f" redness={angle_data.get('redness_score')}" if label in ANALYSIS_ANGLES else "")
-    )
+    print(f"[handler] {label} OK")
     return label, angle_data
 
 
@@ -1433,20 +1165,19 @@ def handler(job):
 
     processed_angles = process_images(images, image_paths, mode)
     primary = processed_angles.get(PRIMARY_ANALYSIS_ANGLE, {})
-    redness_avg = average_analysis_redness(processed_angles)
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary)
         print(
             f"[handler] DB updated OK for scan_id={scan_id} "
-            f"redness_avg={redness_avg} angles={list(ANALYSIS_ANGLES)}"
+            f"prep_only angles={list(ANALYSIS_ANGLES)}"
         )
 
     return {
         "status": "done",
         "scan_id": scan_id,
         "analysis_angles": list(ANALYSIS_ANGLES),
-        "redness_severity": redness_avg,
+        "analysis_step": "prep_only",
         "processed_angles": processed_angles,
     }
 
