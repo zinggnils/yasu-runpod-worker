@@ -12,7 +12,7 @@ import onnxruntime as ort
 import requests
 from PIL import Image, ImageFilter, ImageOps
 
-from mobile_sam_onnx import MobileSamOnnx
+import clipseg_cheek
 
 # Register the HEIF/HEIC opener with Pillow so Image.open() auto-detects HEIC
 # bytes (the format the iOS app uploads). Pillow's auto-detect reads the file
@@ -85,29 +85,21 @@ def _init_matting():
 MATTING_SESSION = _init_matting()
 
 # ---------------------------------------------------------------------------
-# Cheek ROI: single-point MobileSAM on BONE visia (landmarks only place the point)
+# Cheek ROI: CLIPSeg text prompt @ 352px → ear removal → BONE tight crop
 # ---------------------------------------------------------------------------
 FACE_LANDMARKER_PATH = os.environ.get(
     "FACE_LANDMARKER_PATH", "/root/.mediapipe/face_landmarker.task"
 )
 LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "960"))
 CHEEK_TIGHT_PADDING = int(os.environ.get("CHEEK_TIGHT_PADDING", "24"))
-# right_90 profile: default cheek center if landmarks fail (fraction of width/height).
-RIGHT_90_CHEEK_POINT_XY = (
-    float(os.environ.get("RIGHT_90_CHEEK_X", "0.42")),
-    float(os.environ.get("RIGHT_90_CHEEK_Y", "0.40")),
-)
+CLIPSEG_CHEEK_PROMPT = os.environ.get("CLIPSEG_CHEEK_PROMPT", "malar region skin")
+CLIPSEG_EAR_PROMPT = os.environ.get("CLIPSEG_EAR_PROMPT", "ear")
+CLIPSEG_EAR_THRESHOLD = float(os.environ.get("CLIPSEG_EAR_THRESHOLD", "0.35"))
+# Profile ear strip: keep left fraction of cheek mask span (right_90).
+PROFILE_EAR_X_KEEP = float(os.environ.get("PROFILE_EAR_X_KEEP", "0.68"))
 
-# Centroid of subject's right cheek (Face Mesh indices).
-_RIGHT_CHEEK_CORE = (
-    345, 352, 376, 411, 427, 426, 425, 266, 371, 355, 437, 343, 357, 350, 349, 348, 347, 346,
-)
-
-MOBILE_SAM = MobileSamOnnx()
-if MOBILE_SAM.ready:
-    print("[mobile_sam] encoder+decoder OK")
-else:
-    print("[mobile_sam] ONNX models missing — cheek ROI will use alpha fallback")
+# Warm CLIPSeg weights at import (long first cold start moved to image build).
+clipseg_cheek._load()
 
 
 def _init_face_landmarker():
@@ -168,23 +160,6 @@ def detect_face_landmarks(rgb: np.ndarray):
     return result.face_landmarks[0]
 
 
-def cheek_point_right_90(landmarks, width: int, height: int) -> tuple[int, int]:
-    """One positive SAM point — centroid of right cheek landmarks or profile default."""
-    if landmarks is not None:
-        xs: list[float] = []
-        ys: list[float] = []
-        for i in _RIGHT_CHEEK_CORE:
-            if i < len(landmarks):
-                xs.append(landmarks[i].x * width)
-                ys.append(landmarks[i].y * height)
-        if xs:
-            return int(round(sum(xs) / len(xs))), int(round(sum(ys) / len(ys)))
-    return (
-        int(RIGHT_90_CHEEK_POINT_XY[0] * width),
-        int(RIGHT_90_CHEEK_POINT_XY[1] * height),
-    )
-
-
 def _eroded_alpha_u8(alpha: np.ndarray, h: int, w: int) -> np.ndarray:
     erode_px = max(12, int(min(h, w) * 0.04))
     return cv2.erode(
@@ -194,37 +169,92 @@ def _eroded_alpha_u8(alpha: np.ndarray, h: int, w: int) -> np.ndarray:
     )
 
 
+def remove_ear_from_mask(
+    mask: np.ndarray,
+    clean_rgb: np.ndarray,
+    landmarks,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Step 2: subtract ear CLIPSeg + profile geometry + chin cap."""
+    h, w = height, width
+    out = mask.copy()
+
+    # Text prompt: remove ear pixels CLIPSeg finds.
+    ear_mask = clipseg_cheek.predict_mask(
+        clean_rgb, CLIPSEG_EAR_PROMPT, threshold=CLIPSEG_EAR_THRESHOLD
+    )
+    if ear_mask is not None:
+        out &= ~ear_mask
+
+    # right_90 profile: ear sits on the high-x side of the face span.
+    if np.any(out):
+        cols = np.where(np.any(out, axis=0))[0]
+        if cols.size:
+            x_cut = int(cols[0] + (cols[-1] - cols[0]) * PROFILE_EAR_X_KEEP)
+            out &= np.arange(w, dtype=np.int32) <= x_cut
+
+    if landmarks is not None and len(landmarks) > 152:
+        chin_y = int(landmarks[152].y * h) + int(0.04 * h)
+        out[chin_y:, :] = False
+        out_u8 = (out.astype(np.uint8) * 255)
+        for ear_idx in (454, 361, 288, 234):
+            if ear_idx < len(landmarks):
+                ex = int(landmarks[ear_idx].x * w)
+                ey = int(landmarks[ear_idx].y * h)
+                r = max(12, int(0.05 * min(w, h)))
+                cv2.circle(out_u8, (ex, ey), r, 0, -1)
+        out = out_u8 > 127
+
+    return out.astype(bool)
+
+
 def extract_cheek_tight_bone(
     bone_rgb: np.ndarray,
     clean_rgb: np.ndarray,
     alpha: np.ndarray | None,
     landmarks,
-) -> tuple[Image.Image, str, int]:
+) -> tuple[Image.Image, str, int, dict]:
     """
-    Tight cheek on black from BONE visia.
-    SAM runs on clean RGB; mask is applied to bone_rgb.
+    CLIPSeg cheek prompt on clean @ 352 → ear step → mask on BONE → tight crop.
+    Returns (image, method, pixel_count, timing_dict).
     """
     h, w = bone_rgb.shape[:2]
-    point = cheek_point_right_90(landmarks, w, h)
-    method = "mobile_sam_point_bone"
+    timing: dict = {}
 
-    mask = MOBILE_SAM.predict_mask(clean_rgb, point, positive=1)
+    t0 = datetime.now(timezone.utc)
+    mask = clipseg_cheek.predict_mask(clean_rgb, CLIPSEG_CHEEK_PROMPT)
+    timing["clipseg_ms"] = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+    method = "clipseg_bone_tight"
+
     if mask is None or not np.any(mask):
-        method = "point_fallback_alpha"
+        method = "clipseg_fallback_alpha"
         if alpha is None:
-            return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0
+            return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0, timing
         eroded = _eroded_alpha_u8(alpha, h, w)
         mask = eroded > 100
         cols = np.where(np.any(mask, axis=0))[0]
         if cols.size:
-            x_cut = int(cols[0] + (cols[-1] - cols[0]) * 0.68)
+            x_cut = int(cols[0] + (cols[-1] - cols[0]) * PROFILE_EAR_X_KEEP)
             mask &= np.arange(w) <= x_cut
+    else:
+        t1 = datetime.now(timezone.utc)
+        mask = remove_ear_from_mask(mask, clean_rgb, landmarks, width=w, height=h)
+        timing["ear_removal_ms"] = int(
+            (datetime.now(timezone.utc) - t1).total_seconds() * 1000
+        )
 
     if alpha is not None:
         mask &= _eroded_alpha_u8(alpha, h, w) > 100
 
+    # Drop speckles / holes.
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = mask_u8 > 127
+
     if not np.any(mask):
-        return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0
+        return Image.fromarray(np.zeros((1, 1, 3), dtype=np.uint8)), method, 0, timing
 
     ys, xs = np.where(mask)
     pad = CHEEK_TIGHT_PADDING
@@ -237,7 +267,7 @@ def extract_cheek_tight_bone(
     mask_crop = mask[y1:y2, x1:x2]
     crop[~mask_crop] = 0
     pixels = int(mask_crop.sum())
-    return Image.fromarray(crop, mode="RGB"), method, pixels
+    return Image.fromarray(crop, mode="RGB"), method, pixels, timing
 
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
@@ -1192,7 +1222,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         bone_rgb = np.array(visia.convert("RGB"))
         t_lm = datetime.now(timezone.utc)
         landmarks = detect_face_landmarks(rgb)
-        cheek_preview, cheek_method, cheek_pixels = extract_cheek_tight_bone(
+        cheek_preview, cheek_method, cheek_pixels, cheek_timing = extract_cheek_tight_bone(
             bone_rgb, rgb, alpha, landmarks
         )
         cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
@@ -1203,16 +1233,19 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
             {
                 "analysis_step": "cheek_roi",
                 "cheek_roi_method": cheek_method,
+                "cheek_roi_prompt": CLIPSEG_CHEEK_PROMPT,
                 "cheek_roi_image_url": cheek_url,
                 "cheek_pixel_count": cheek_pixels,
                 "landmark_ms": lm_ms,
+                **cheek_timing,
                 **compute_quality(clean, label),
             }
         )
         print(
             f"[handler] {label} cheek_roi method={cheek_method} "
-            f"point={cheek_point_right_90(landmarks, bone_rgb.shape[1], bone_rgb.shape[0])} "
-            f"pixels={cheek_pixels} landmark_ms={lm_ms} sam_ready={MOBILE_SAM.ready}"
+            f"prompt={CLIPSEG_CHEEK_PROMPT!r} pixels={cheek_pixels} "
+            f"timing={cheek_timing} landmark_ms={lm_ms} "
+            f"clipseg_ready={clipseg_cheek.clipseg_ready()}"
         )
 
     print(f"[handler] {label} OK")

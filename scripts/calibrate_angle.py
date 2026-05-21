@@ -62,7 +62,7 @@ def main() -> None:
     rgb = np.array(clean.convert("RGB"))
     bone_rgb = np.array(visia.convert("RGB"))
     landmarks = handler.detect_face_landmarks(rgb)
-    cheek_img, cheek_method, cheek_pixels = handler.extract_cheek_tight_bone(
+    cheek_img, cheek_method, cheek_pixels, cheek_timing = handler.extract_cheek_tight_bone(
         bone_rgb, rgb, alpha, landmarks
     )
     cheek_img.save(out_dir / "07_cheek_bone_tight.png", quality=95)
@@ -72,6 +72,7 @@ def main() -> None:
         "analysis_step": "cheek_roi",
         "cheek_roi_method": cheek_method,
         "cheek_pixel_count": cheek_pixels,
+        "cheek_timing": cheek_timing,
         "landmarks_detected": landmarks is not None,
         "matting": alpha is not None,
         **handler.compute_quality(clean, args.angle),

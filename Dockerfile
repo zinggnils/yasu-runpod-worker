@@ -1,5 +1,4 @@
-# CPU-only image: this worker does PIL/OpenCV processing + ONNX Runtime CPU
-# inference for MODNet portrait matting. No CUDA/PyTorch needed.
+# CPU worker: MODNet (ONNX) + CLIPSeg cheek ROI (PyTorch CPU) + MediaPipe landmarks.
 FROM python:3.11-slim
 
 # libgl1: OpenCV/mediapipe wheels may link libGL.so.1 even in serverless (no GUI).
@@ -17,9 +16,16 @@ COPY requirements.txt .
 # opencv-contrib-python which requires libGL at import time on slim images.
 RUN pip install --upgrade pip && \
     pip install "opencv-python-headless==4.10.0.84" && \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install -r requirements.txt && \
     pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless 2>/dev/null || true && \
     pip install --force-reinstall --no-deps "opencv-python-headless==4.10.0.84"
+
+ENV HF_HOME=/root/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/root/.cache/huggingface
+RUN python -c "from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation; \
+    CLIPSegProcessor.from_pretrained('CIDAS/clipseg-rd64-refined'); \
+    CLIPSegForImageSegmentation.from_pretrained('CIDAS/clipseg-rd64-refined')"
 
 # Pre-download MODNet portrait matting weights into the image so cold-starts
 # don't pay the ~25 MB download every time. MODNet is the simple, fast
@@ -35,11 +41,5 @@ RUN mkdir -p /root/.mediapipe && \
     curl -fL https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task \
       -o /root/.mediapipe/face_landmarker.task
 
-RUN mkdir -p /root/.mobilesam && \
-    curl -fL https://huggingface.co/Acly/MobileSAM/resolve/main/mobile_sam_image_encoder.onnx \
-      -o /root/.mobilesam/mobile_sam_image_encoder.onnx && \
-    curl -fL https://huggingface.co/Acly/MobileSAM/resolve/main/sam_mask_decoder_single.onnx \
-      -o /root/.mobilesam/sam_mask_decoder_single.onnx
-
-COPY mobile_sam_onnx.py handler.py .
+COPY clipseg_cheek.py handler.py .
 CMD ["python", "-u", "handler.py"]

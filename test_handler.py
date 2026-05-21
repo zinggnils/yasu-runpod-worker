@@ -35,7 +35,7 @@ class Right90PrepTests(unittest.TestCase):
         self.assertEqual(result["analysis_step"], "cheek_roi")
         self.assertIn(
             result["cheek_roi_method"],
-            ("mobile_sam_point_bone", "point_fallback_alpha"),
+            ("clipseg_bone_tight", "clipseg_fallback_alpha"),
         )
         self.assertIn("cheek_roi_image_url", result)
         self.assertTrue(result["cheek_roi_image_url"].endswith(".png"))
