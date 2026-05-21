@@ -20,5 +20,9 @@ RUN mkdir -p /root/.modnet && \
     curl -fL https://github.com/yakhyo/modnet/releases/download/weights/modnet_photographic.onnx \
       -o /root/.modnet/modnet_photographic.onnx
 
+RUN mkdir -p /root/.mediapipe && \
+    curl -fL https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task \
+      -o /root/.mediapipe/face_landmarker.task
+
 COPY handler.py .
 CMD ["python", "-u", "handler.py"]

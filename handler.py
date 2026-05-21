@@ -82,6 +82,203 @@ def _init_matting():
 
 MATTING_SESSION = _init_matting()
 
+# ---------------------------------------------------------------------------
+# MediaPipe Face Landmarker — right_90 cheek polygon (fast CPU, ~50–150 ms)
+# ---------------------------------------------------------------------------
+FACE_LANDMARKER_PATH = os.environ.get(
+    "FACE_LANDMARKER_PATH", "/root/.mediapipe/face_landmarker.task"
+)
+LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "640"))
+
+# Malar / jaw landmarks used to build a cheek hull on right profile.
+# Patient faces right → nose is image-left, ear is image-right.
+_RIGHT_90_CHEEK_LANDMARK_IDX = (
+    67, 109, 10, 151, 9, 336, 296, 334, 293, 300,
+    123, 116, 117, 118, 119, 120, 121, 126, 142, 36,
+    205, 206, 207, 213, 192, 147, 187, 50, 101,
+    138, 135, 169, 170, 140, 171, 175,
+    396, 369, 395, 394, 364, 365, 379, 378, 400, 377,
+    152, 148, 176, 149, 150, 136, 172,
+    220, 134, 51, 45, 44, 4, 5, 6,
+)
+
+
+def _init_face_landmarker():
+    model_path = Path(FACE_LANDMARKER_PATH)
+    if not model_path.exists() or model_path.stat().st_size == 0:
+        print(f"[landmarks] model not found at {model_path}; cheek ROI uses alpha fallback")
+        return None
+    try:
+        import mediapipe as mp
+        from mediapipe.tasks.python import vision
+        from mediapipe.tasks.python.core import base_options as mp_base
+
+        opts = vision.FaceLandmarkerOptions(
+            base_options=mp_base.BaseOptions(model_asset_path=str(model_path)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+        )
+        landmarker = vision.FaceLandmarker.create_from_options(opts)
+        print("[landmarks] FaceLandmarker session OK")
+        return landmarker
+    except Exception as exc:  # noqa: BLE001
+        print(f"[landmarks] init failed: {exc}")
+        return None
+
+
+FACE_LANDMARKER = _init_face_landmarker()
+_MP_IMAGE_FORMAT = None
+
+
+def _mp_image(rgb: np.ndarray):
+    global _MP_IMAGE_FORMAT
+    import mediapipe as mp
+
+    if _MP_IMAGE_FORMAT is None:
+        _MP_IMAGE_FORMAT = mp.ImageFormat.SRGB
+    return mp.Image(image_format=_MP_IMAGE_FORMAT, data=np.ascontiguousarray(rgb))
+
+
+def detect_face_landmarks(rgb: np.ndarray):
+    """478 landmarks in full-image pixel coords, or None."""
+    if FACE_LANDMARKER is None:
+        return None
+    h, w = rgb.shape[:2]
+    scale = LANDMARK_LONG_EDGE / float(max(h, w))
+    if scale < 1.0:
+        nw = max(1, int(round(w * scale)))
+        nh = max(1, int(round(h * scale)))
+        small = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+    else:
+        small = rgb
+    try:
+        result = FACE_LANDMARKER.detect(_mp_image(small))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[landmarks] detect failed: {exc}")
+        return None
+    if not result.face_landmarks:
+        return None
+    return result.face_landmarks[0]
+
+
+def cheek_polygon_right_90(landmarks, width: int, height: int) -> np.ndarray | None:
+    """Convex cheek hull with profile ear/nose clipping (right_90 only)."""
+    pts = np.array(
+        [
+            (landmarks[i].x * width, landmarks[i].y * height)
+            for i in _RIGHT_90_CHEEK_LANDMARK_IDX
+            if i < len(landmarks)
+        ],
+        dtype=np.float32,
+    )
+    if pts.shape[0] < 4:
+        return None
+
+    nose_x = landmarks[1].x * width
+    chin_y = landmarks[152].y * height
+    face_w = float(np.ptp(pts[:, 0]))
+    face_h = float(np.ptp(pts[:, 1]))
+    if face_w < width * 0.05 or face_h < height * 0.05:
+        return None
+
+    # Profile: ear on high-x side; cut before ear blob.
+    x_ear = float(np.percentile(pts[:, 0], 90))
+    x_nose = nose_x + 0.04 * face_w
+    y_top = float(np.percentile(pts[:, 1], 18))
+    y_bot = min(chin_y + 0.03 * height, float(np.percentile(pts[:, 1], 90)))
+
+    keep = (
+        (pts[:, 0] >= x_nose)
+        & (pts[:, 0] <= x_ear * 0.93)
+        & (pts[:, 1] >= y_top)
+        & (pts[:, 1] <= y_bot)
+    )
+    filtered = pts[keep]
+    if filtered.shape[0] < 3:
+        return None
+
+    hull = cv2.convexHull(filtered)
+    poly = hull.reshape(-1, 2).astype(np.float32)
+    poly[:, 0] = np.minimum(poly[:, 0], x_ear * 0.93)
+    return poly
+
+
+def _brightness(rgb: np.ndarray) -> np.ndarray:
+    return (
+        0.2126 * rgb[..., 0].astype(np.float32)
+        + 0.7152 * rgb[..., 1].astype(np.float32)
+        + 0.0722 * rgb[..., 2].astype(np.float32)
+    ) / 255.0
+
+
+def cheek_mask_alpha_fallback(rgb: np.ndarray, alpha_u8: np.ndarray) -> np.ndarray:
+    """MODNet erode + profile x-band when landmarks are unavailable."""
+    h, w = rgb.shape[:2]
+    erode_px = max(15, int(min(h, w) * 0.05))
+    eroded = cv2.erode(
+        alpha_u8, np.ones((erode_px, erode_px), np.uint8), iterations=1
+    )
+    mask = (eroded > 100) & (_brightness(rgb) > 0.18)
+    cols = np.where(np.any(mask, axis=0))[0]
+    if cols.size == 0:
+        return mask
+    x0, x1 = int(cols[0]), int(cols[-1])
+    span = max(1, x1 - x0)
+    # Right profile: cheek is left ~70% of face span (exclude ear on the right).
+    x_cut = x0 + int(span * 0.72)
+    xs = np.arange(w, dtype=np.int32)
+    mask &= xs <= x_cut
+    return mask
+
+
+def build_right_90_cheek_mask(
+    rgb: np.ndarray, alpha: np.ndarray | None, landmarks
+) -> tuple[np.ndarray, str]:
+    h, w = rgb.shape[:2]
+    method = "mediapipe_polygon"
+    poly = cheek_polygon_right_90(landmarks, w, h) if landmarks is not None else None
+
+    if poly is not None and poly.shape[0] >= 3:
+        mask_u8 = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(mask_u8, [poly.astype(np.int32)], 255)
+        mask = mask_u8 > 0
+    else:
+        method = "alpha_fallback"
+        alpha_u8 = (
+            alpha.astype(np.uint8)
+            if alpha is not None
+            else np.full((h, w), 255, np.uint8)
+        )
+        mask = cheek_mask_alpha_fallback(rgb, alpha_u8)
+
+    if alpha is not None:
+        erode_px = max(12, int(min(h, w) * 0.035))
+        eroded = cv2.erode(
+            alpha.astype(np.uint8),
+            np.ones((erode_px, erode_px), np.uint8),
+            iterations=1,
+        )
+        mask &= eroded > 100
+
+    if not np.any(mask):
+        method = "alpha_fallback"
+        alpha_u8 = (
+            alpha.astype(np.uint8)
+            if alpha is not None
+            else np.full((h, w), 255, np.uint8)
+        )
+        mask = cheek_mask_alpha_fallback(rgb, alpha_u8)
+
+    return mask, method
+
+
+def render_cheek_cutout(clean: Image.Image, cheek_mask: np.ndarray) -> Image.Image:
+    """Cheek pixels on black (QA preview, matches clinic reference layout)."""
+    rgb = np.array(clean.convert("RGB"))
+    out = np.zeros_like(rgb)
+    out[cheek_mask] = rgb[cheek_mask]
+    return Image.fromarray(out, mode="RGB")
+
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
     """Resize to MODNET_INPUT_SIZE long edge, with both sides multiples of
@@ -1031,11 +1228,30 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
+        rgb = np.array(clean.convert("RGB"))
+        t_lm = datetime.now(timezone.utc)
+        landmarks = detect_face_landmarks(rgb)
+        cheek_mask, cheek_method = build_right_90_cheek_mask(
+            rgb, alpha, landmarks
+        )
+        cheek_preview = render_cheek_cutout(clean, cheek_mask)
+        cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
+        lm_ms = int(
+            (datetime.now(timezone.utc) - t_lm).total_seconds() * 1000
+        )
         angle_data.update(
             {
-                "analysis_step": "prep_only",
+                "analysis_step": "cheek_roi",
+                "cheek_roi_method": cheek_method,
+                "cheek_roi_image_url": cheek_url,
+                "cheek_pixel_count": int(cheek_mask.sum()),
+                "landmark_ms": lm_ms,
                 **compute_quality(clean, label),
             }
+        )
+        print(
+            f"[handler] {label} cheek_roi method={cheek_method} "
+            f"pixels={cheek_mask.sum()} landmark_ms={lm_ms}"
         )
 
     print(f"[handler] {label} OK")

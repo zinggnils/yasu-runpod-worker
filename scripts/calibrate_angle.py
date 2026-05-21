@@ -23,6 +23,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,9 +59,24 @@ def main() -> None:
     crop = handler.fixed_analysis_crop(clean)
     crop.save(out_dir / "05_center_crop_1000.jpg", quality=95)
 
+    rgb = np.array(clean.convert("RGB"))
+    landmarks = handler.detect_face_landmarks(rgb)
+    cheek_mask, cheek_method = handler.build_right_90_cheek_mask(
+        rgb, alpha, landmarks
+    )
+    handler.render_cheek_cutout(clean, cheek_mask).save(
+        out_dir / "07_cheek_cutout.png", quality=95
+    )
+    Image.fromarray((cheek_mask.astype(np.uint8) * 255)).save(
+        out_dir / "08_cheek_mask.png"
+    )
+
     prep = {
         "angle": args.angle,
-        "analysis_step": "prep_only",
+        "analysis_step": "cheek_roi",
+        "cheek_roi_method": cheek_method,
+        "cheek_pixel_count": int(cheek_mask.sum()),
+        "landmarks_detected": landmarks is not None,
         "matting": alpha is not None,
         **handler.compute_quality(clean, args.angle),
         "face_bbox": list(handler.detect_face_bbox(clean, args.angle) or ()),
