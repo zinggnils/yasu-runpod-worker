@@ -1041,6 +1041,16 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
 
     visia = make_analysis_map(clean, mode, alpha=alpha)
 
+    cheek_preview = None
+    cheek_method = ""
+    cheek_pixels = 0
+    cheek_timing: dict = {}
+    if label in ANALYSIS_ANGLES:
+        # Run Gemini before large Supabase uploads so slow API work starts ASAP.
+        cheek_preview, cheek_method, cheek_pixels, cheek_timing = (
+            extract_cheek_gemini_fragment(visia)
+        )
+
     if label in ANALYSIS_ANGLES:
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     else:
@@ -1058,9 +1068,6 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     }
 
     if label in ANALYSIS_ANGLES:
-        cheek_preview, cheek_method, cheek_pixels, cheek_timing = (
-            extract_cheek_gemini_fragment(visia)
-        )
         cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
         angle_data.update(
             {
@@ -1219,7 +1226,7 @@ def handler(job):
         "status": "done",
         "scan_id": scan_id,
         "analysis_angles": list(ANALYSIS_ANGLES),
-        "analysis_step": "prep_only",
+        "analysis_step": primary.get("analysis_step", "prep_only"),
         "processed_angles": processed_angles,
     }
 
