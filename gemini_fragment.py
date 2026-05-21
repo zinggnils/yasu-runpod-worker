@@ -9,14 +9,35 @@ import cv2
 import numpy as np
 from PIL import Image
 
-GEMINI_FRAGMENT_PROMPT = """Deconstruct the portrait into fragmented, isolated skin texture pieces.
-Extract only the cheek and jaw area as a single irregular polygon shape —
-no eyes, no nose, no full face. Float the fragment on pure black background.
-Keep the blue-tinted monochrome duotone color grading.
-The fragment should appear as a geometric cutout with sharp, angular edges,
-like a torn or shattered piece of the face. No other facial features visible.
-lastly remove all shapes but the biggest one completely from the picture
-IMPORTANT: Final check, if there are still any Parts of the eye, mouth, nose, ear to See remove from Fragment"""
+GEMINI_FRAGMENT_PROMPT = """Transform this portrait into a single floating skin texture fragment on a pure
+black background.
+
+WHAT TO SHOW:
+- One single polygon shape only — the cheek zone specifically,
+  meaning the flat area between the ear and nose, below the eye socket,
+  above the jawline
+- Pure skin texture fill inside the shape: pores, subtle discoloration,
+  fine hair, realistic skin surface
+- Blue-grey cold monochrome duotone color grading matching the original photo
+- Sharp straight geometric edges on the polygon (5-7 sides)
+- Pure black void everywhere outside the single shape
+
+WHAT MUST NOT APPEAR — STRICT EXCLUSIONS:
+- NO eye, eyelid, eyelash, eyebrow — not even partially cropped
+- NO ear, ear canal, earlobe — not even the edge of one
+- NO nose, nostril, nose bridge — not even a sliver
+- NO mouth, lips, chin — not even partially
+- NO neck, hair, clothing
+- NO multiple shapes, fragments, or secondary pieces — only ONE polygon
+- NO face outline or silhouette recognizable as a face
+
+COMPOSITION:
+- The single polygon floats centered on pure black
+- It should look like a skin sample or geological cross-section,
+  not like a face crop
+- If any facial feature appears at the edge of the polygon,
+  crop it out entirely — shrink the shape inward until only
+  featureless skin texture remains"""
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 GEMINI_FRAGMENT_MODEL = os.environ.get(
