@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from io import BytesIO
 
+import cv2
+import numpy as np
 from PIL import Image
 
 # Exact prompt from product spec (Gemini 3.1 / Nano Banana workflow).
@@ -17,11 +19,29 @@ like a torn or shattered piece of the face. No other facial features visible.
 lastly remove all shapes but the biggest one completely from the picture"""
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-# Nano Banana 2 / Gemini 3.1 Flash Image — override via RunPod env if needed.
+# Nano Banana 2 = gemini-3.1-flash-image-preview (override on RunPod if needed).
 GEMINI_FRAGMENT_MODEL = os.environ.get(
-    "GEMINI_FRAGMENT_MODEL", "gemini-2.5-flash-image"
+    "GEMINI_FRAGMENT_MODEL", "gemini-3.1-flash-image-preview"
 )
 GEMINI_FRAGMENT_MAX_EDGE = int(os.environ.get("GEMINI_FRAGMENT_MAX_EDGE", "1536"))
+
+
+def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:
+    """Drop smaller blobs so only the biggest cheek cutout remains on black."""
+    arr = np.array(rgb)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    _, fg = cv2.threshold(gray, 12, 255, cv2.THRESH_BINARY)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    if n_labels <= 2:
+        return rgb
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if areas.size == 0:
+        return rgb
+    best = 1 + int(np.argmax(areas))
+    mask = labels == best
+    out = arr.copy()
+    out[~mask] = 0
+    return Image.fromarray(out, mode="RGB")
 
 
 def _prepare_input(img: Image.Image) -> Image.Image:
@@ -72,13 +92,13 @@ def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | N
     for part in response.candidates[0].content.parts:
         inline = getattr(part, "inline_data", None)
         if inline is not None and inline.data:
-            out = Image.open(BytesIO(inline.data))
-            return out.convert("RGB"), None
+            out = Image.open(BytesIO(inline.data)).convert("RGB")
+            return _keep_largest_fragment(out), None
         # Some SDK versions expose as part.as_image()
         try:
             out = part.as_image()
             if out is not None:
-                return out.convert("RGB"), None
+                return _keep_largest_fragment(out.convert("RGB")), None
         except Exception:  # noqa: BLE001
             pass
 
