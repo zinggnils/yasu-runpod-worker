@@ -30,8 +30,8 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "scans")
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-# Angles that get the 1000×1000 ROI crop + redness scoring (avg drives scan severity).
-ANALYSIS_ANGLES = ("right_90", "left_45")
+# Redness scoring: right profile only (single source of truth for severity).
+ANALYSIS_ANGLES = ("right_90",)
 PRIMARY_ANALYSIS_ANGLE = "right_90"
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
@@ -328,12 +328,15 @@ def detect_face_bbox(
     primary = FACE_PROFILE if is_profile else FACE_FRONTAL
     fallback = FACE_FRONTAL if is_profile else FACE_PROFILE
 
+    # Right 90° profiles: slightly looser Haar so we avoid center_fallback on cheek.
+    min_neighbors = 4 if angle_label == "right_90" else 5
+    min_size = (120, 120) if angle_label == "right_90" else (150, 150)
     for cascade in (primary, fallback):
         faces = cascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(150, 150),
+            minNeighbors=min_neighbors,
+            minSize=min_size,
         )
         if len(faces) > 0:
             x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
@@ -498,11 +501,12 @@ def fixed_analysis_crop(img: Image.Image) -> Image.Image:
 
 # Fractions of the Haar face box that cover the visible cheek (upper-mid profile).
 _CHEEK_FRAC: dict[str, tuple[float, float, float, float]] = {
-    # left_45: patient's left cheek toward camera → left + upper-mid of face box
-    "left_45": (0.0, 0.32, 0.58, 0.74),
-    # right_90: right profile → cheek bulge on the right + upper-mid of face box
-    "right_90": (0.36, 0.30, 1.0, 0.76),
+    # right_90: cheek mound — avoid far-right ear/hair (was 0.36–1.0 → redness 0)
+    "right_90": (0.48, 0.26, 0.88, 0.68),
 }
+
+# Portrait fractions when Haar fails on right_90 (profile cheek sits center-right).
+_RIGHT90_FALLBACK_FRAC = (0.50, 0.24, 0.86, 0.58)
 
 
 def _clamp_box(l: int, t: int, r: int, b: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -534,41 +538,67 @@ def cheek_box_from_face(
     return l, t, r, b
 
 
+def _crop_box_to_analysis(
+    img: Image.Image,
+    alpha: np.ndarray | None,
+    l: int,
+    t: int,
+    r: int,
+    b: int,
+    method: str,
+) -> tuple[Image.Image, np.ndarray | None, dict]:
+    w, h = img.size
+    cheek = img.crop((l, t, r, b))
+    crop = ImageOps.fit(
+        cheek,
+        (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE),
+        method=Image.Resampling.BILINEAR,
+        centering=(0.5, 0.5),
+    )
+    alpha_crop = None
+    if alpha is not None:
+        patch = alpha[t:b, l:r]
+        alpha_crop = np.array(
+            Image.fromarray(patch).resize(
+                (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE),
+                Image.Resampling.BILINEAR,
+            )
+        )
+    return (
+        crop,
+        alpha_crop,
+        {"x": l, "y": t, "width": r - l, "height": b - t, "method": method},
+    )
+
+
+def right_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
+    """Fixed cheek region for right 90° when Haar misses (better than dead center)."""
+    lf, tf, rf, bf = _RIGHT90_FALLBACK_FRAC
+    l = int(img_w * lf)
+    r = int(img_w * rf)
+    t = int(img_h * tf)
+    b = int(img_h * bf)
+    l, t, r, b = _clamp_box(l, t, r, b, img_w, img_h)
+    cx = (l + r) // 2
+    cy = (t + b) // 2
+    side = max(r - l, b - t, int(min(img_w, img_h) * 0.16))
+    half = side // 2
+    return _clamp_box(cx - half, cy - half, cx + half, cy + half, img_w, img_h)
+
+
 def analysis_roi_crop(
     img: Image.Image, alpha: np.ndarray | None, label: str
 ) -> tuple[Image.Image, np.ndarray | None, dict]:
-    """Cheek-focused 1000×1000 ROI for redness scoring (fast Haar, no landmarks)."""
+    """Cheek-focused 1000×1000 ROI for redness scoring (right_90 only)."""
     w, h = img.size
     bbox = detect_face_bbox_fast(img, label)
     if bbox is not None:
         l, t, r, b = cheek_box_from_face(bbox, label, w, h)
-        cheek = img.crop((l, t, r, b))
-        crop = ImageOps.fit(
-            cheek,
-            (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE),
-            method=Image.Resampling.BILINEAR,
-            centering=(0.5, 0.5),
-        )
-        alpha_crop = None
-        if alpha is not None:
-            patch = alpha[t:b, l:r]
-            alpha_crop = np.array(
-                Image.fromarray(patch).resize(
-                    (ANALYSIS_CROP_SIZE, ANALYSIS_CROP_SIZE),
-                    Image.Resampling.BILINEAR,
-                )
-            )
-        return (
-            crop,
-            alpha_crop,
-            {
-                "x": l,
-                "y": t,
-                "width": r - l,
-                "height": b - t,
-                "method": "cheek_bbox",
-            },
-        )
+        return _crop_box_to_analysis(img, alpha, l, t, r, b, "cheek_bbox")
+
+    if label == "right_90":
+        l, t, r, b = right_profile_fallback_box(w, h)
+        return _crop_box_to_analysis(img, alpha, l, t, r, b, "right_profile_fallback")
 
     crop = fixed_analysis_crop(img)
     left = (w - ANALYSIS_CROP_SIZE) // 2
