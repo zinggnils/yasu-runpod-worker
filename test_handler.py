@@ -33,7 +33,10 @@ class Right90PrepTests(unittest.TestCase):
         result = handler.process_images({"right_90": image_to_b64(img)}, {}, "redness")["right_90"]
 
         self.assertEqual(result["analysis_step"], "cheek_roi")
-        self.assertIn(result["cheek_roi_method"], ("mediapipe_polygon", "alpha_fallback"))
+        self.assertIn(
+            result["cheek_roi_method"],
+            ("mediapipe_core_bone_tight", "bone_alpha_fallback"),
+        )
         self.assertIn("cheek_roi_image_url", result)
         self.assertTrue(result["cheek_roi_image_url"].endswith(".png"))
         self.assertIn("visia_image_url", result)

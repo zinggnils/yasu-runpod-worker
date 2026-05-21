@@ -60,22 +60,18 @@ def main() -> None:
     crop.save(out_dir / "05_center_crop_1000.jpg", quality=95)
 
     rgb = np.array(clean.convert("RGB"))
+    bone_rgb = np.array(visia.convert("RGB"))
     landmarks = handler.detect_face_landmarks(rgb)
-    cheek_mask, cheek_method = handler.build_right_90_cheek_mask(
-        rgb, alpha, landmarks
+    cheek_img, cheek_method, cheek_pixels = handler.extract_cheek_tight_bone(
+        bone_rgb, alpha, landmarks
     )
-    handler.render_cheek_cutout(clean, cheek_mask).save(
-        out_dir / "07_cheek_cutout.png", quality=95
-    )
-    Image.fromarray((cheek_mask.astype(np.uint8) * 255)).save(
-        out_dir / "08_cheek_mask.png"
-    )
+    cheek_img.save(out_dir / "07_cheek_bone_tight.png", quality=95)
 
     prep = {
         "angle": args.angle,
         "analysis_step": "cheek_roi",
         "cheek_roi_method": cheek_method,
-        "cheek_pixel_count": int(cheek_mask.sum()),
+        "cheek_pixel_count": cheek_pixels,
         "landmarks_detected": landmarks is not None,
         "matting": alpha is not None,
         **handler.compute_quality(clean, args.angle),

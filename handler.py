@@ -88,18 +88,13 @@ MATTING_SESSION = _init_matting()
 FACE_LANDMARKER_PATH = os.environ.get(
     "FACE_LANDMARKER_PATH", "/root/.mediapipe/face_landmarker.task"
 )
-LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "640"))
+LANDMARK_LONG_EDGE = int(os.environ.get("LANDMARK_LONG_EDGE", "1280"))
+CHEEK_TIGHT_PADDING = int(os.environ.get("CHEEK_TIGHT_PADDING", "24"))
+CHEEK_MASK_FEATHER = int(os.environ.get("CHEEK_MASK_FEATHER", "3"))
 
-# Malar / jaw landmarks used to build a cheek hull on right profile.
-# Patient faces right → nose is image-left, ear is image-right.
-_RIGHT_90_CHEEK_LANDMARK_IDX = (
-    67, 109, 10, 151, 9, 336, 296, 334, 293, 300,
-    123, 116, 117, 118, 119, 120, 121, 126, 142, 36,
-    205, 206, 207, 213, 192, 147, 187, 50, 101,
-    138, 135, 169, 170, 140, 171, 175,
-    396, 369, 395, 394, 364, 365, 379, 378, 400, 377,
-    152, 148, 176, 149, 150, 136, 172,
-    220, 134, 51, 45, 44, 4, 5, 6,
+# Subject's right cheek — ordered polygon (Face Mesh indices). right_90 shows this cheek.
+_RIGHT_CHEEK_CORE = (
+    345, 352, 376, 411, 427, 426, 425, 266, 371, 355, 437, 343, 357, 350, 349, 348, 347, 346,
 )
 
 
@@ -161,123 +156,95 @@ def detect_face_landmarks(rgb: np.ndarray):
     return result.face_landmarks[0]
 
 
-def cheek_polygon_right_90(landmarks, width: int, height: int) -> np.ndarray | None:
-    """Convex cheek hull with profile ear/nose clipping (right_90 only)."""
-    pts = np.array(
-        [
-            (landmarks[i].x * width, landmarks[i].y * height)
-            for i in _RIGHT_90_CHEEK_LANDMARK_IDX
-            if i < len(landmarks)
-        ],
-        dtype=np.float32,
-    )
-    if pts.shape[0] < 4:
+def _cheek_polygon_points(landmarks, width: int, height: int) -> np.ndarray | None:
+    """Ordered malar polygon for subject's right cheek (right_90)."""
+    try:
+        points = np.array(
+            [
+                (int(landmarks[i].x * width), int(landmarks[i].y * height))
+                for i in _RIGHT_CHEEK_CORE
+                if i < len(landmarks)
+            ],
+            dtype=np.int32,
+        )
+    except (IndexError, TypeError):
         return None
-
-    nose_x = landmarks[1].x * width
-    chin_y = landmarks[152].y * height
-    face_w = float(np.ptp(pts[:, 0]))
-    face_h = float(np.ptp(pts[:, 1]))
-    if face_w < width * 0.05 or face_h < height * 0.05:
+    if points.shape[0] < 3:
         return None
+    return points
 
-    # Profile: ear on high-x side; cut before ear blob.
-    x_ear = float(np.percentile(pts[:, 0], 90))
-    x_nose = nose_x + 0.04 * face_w
-    y_top = float(np.percentile(pts[:, 1], 18))
-    y_bot = min(chin_y + 0.03 * height, float(np.percentile(pts[:, 1], 90)))
 
-    keep = (
-        (pts[:, 0] >= x_nose)
-        & (pts[:, 0] <= x_ear * 0.93)
-        & (pts[:, 1] >= y_top)
-        & (pts[:, 1] <= y_bot)
+def _eroded_alpha_u8(alpha: np.ndarray, h: int, w: int) -> np.ndarray:
+    erode_px = max(12, int(min(h, w) * 0.04))
+    return cv2.erode(
+        alpha.astype(np.uint8),
+        np.ones((erode_px, erode_px), np.uint8),
+        iterations=1,
     )
-    filtered = pts[keep]
-    if filtered.shape[0] < 3:
-        return None
-
-    hull = cv2.convexHull(filtered)
-    poly = hull.reshape(-1, 2).astype(np.float32)
-    poly[:, 0] = np.minimum(poly[:, 0], x_ear * 0.93)
-    return poly
 
 
-def _brightness(rgb: np.ndarray) -> np.ndarray:
-    return (
-        0.2126 * rgb[..., 0].astype(np.float32)
-        + 0.7152 * rgb[..., 1].astype(np.float32)
-        + 0.0722 * rgb[..., 2].astype(np.float32)
-    ) / 255.0
+def extract_cheek_tight_bone(
+    bone_rgb: np.ndarray,
+    alpha: np.ndarray | None,
+    landmarks,
+) -> tuple[Image.Image, str, int]:
+    """
+    Tight cheek fragment on black from BONE colormap image.
+    Landmarks from clean RGB; mask applied to visia/bone output.
+    """
+    h, w = bone_rgb.shape[:2]
+    points = _cheek_polygon_points(landmarks, w, h) if landmarks is not None else None
+    method = "mediapipe_core_bone_tight"
 
-
-def cheek_mask_alpha_fallback(rgb: np.ndarray, alpha_u8: np.ndarray) -> np.ndarray:
-    """MODNet erode + profile x-band when landmarks are unavailable."""
-    h, w = rgb.shape[:2]
-    erode_px = max(15, int(min(h, w) * 0.05))
-    eroded = cv2.erode(
-        alpha_u8, np.ones((erode_px, erode_px), np.uint8), iterations=1
-    )
-    mask = (eroded > 100) & (_brightness(rgb) > 0.18)
-    cols = np.where(np.any(mask, axis=0))[0]
-    if cols.size == 0:
-        return mask
-    x0, x1 = int(cols[0]), int(cols[-1])
-    span = max(1, x1 - x0)
-    # Right profile: cheek is left ~70% of face span (exclude ear on the right).
-    x_cut = x0 + int(span * 0.72)
-    xs = np.arange(w, dtype=np.int32)
-    mask &= xs <= x_cut
-    return mask
-
-
-def build_right_90_cheek_mask(
-    rgb: np.ndarray, alpha: np.ndarray | None, landmarks
-) -> tuple[np.ndarray, str]:
-    h, w = rgb.shape[:2]
-    method = "mediapipe_polygon"
-    poly = cheek_polygon_right_90(landmarks, w, h) if landmarks is not None else None
-
-    if poly is not None and poly.shape[0] >= 3:
-        mask_u8 = np.zeros((h, w), np.uint8)
-        cv2.fillPoly(mask_u8, [poly.astype(np.int32)], 255)
-        mask = mask_u8 > 0
+    if points is None:
+        method = "bone_alpha_fallback"
+        if alpha is None:
+            return Image.fromarray(np.zeros_like(bone_rgb)), method, 0
+        eroded = _eroded_alpha_u8(alpha, h, w)
+        mask = eroded > 100
+        cols = np.where(np.any(mask, axis=0))[0]
+        if cols.size:
+            x_cut = int(cols[0] + (cols[-1] - cols[0]) * 0.68)
+            mask &= np.arange(w) <= x_cut
+        points = cv2.findNonZero(mask.astype(np.uint8) * 255)
+        if points is None:
+            return Image.fromarray(np.zeros_like(bone_rgb)), method, 0
+        x, y, bw, bh = cv2.boundingRect(points)
     else:
-        method = "alpha_fallback"
-        alpha_u8 = (
-            alpha.astype(np.uint8)
-            if alpha is not None
-            else np.full((h, w), 255, np.uint8)
-        )
-        mask = cheek_mask_alpha_fallback(rgb, alpha_u8)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [points], 255)
+        if alpha is not None:
+            mask = cv2.bitwise_and(mask, _eroded_alpha_u8(alpha, h, w))
+        if CHEEK_MASK_FEATHER > 0:
+            k = CHEEK_MASK_FEATHER * 2 + 1
+            mask = cv2.GaussianBlur(mask, (k, k), CHEEK_MASK_FEATHER)
+        x, y, bw, bh = cv2.boundingRect(points)
 
-    if alpha is not None:
-        erode_px = max(12, int(min(h, w) * 0.035))
-        eroded = cv2.erode(
-            alpha.astype(np.uint8),
-            np.ones((erode_px, erode_px), np.uint8),
-            iterations=1,
-        )
-        mask &= eroded > 100
+    pad = CHEEK_TIGHT_PADDING
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(w, x + bw + pad)
+    y2 = min(h, y + bh + pad)
 
-    if not np.any(mask):
-        method = "alpha_fallback"
-        alpha_u8 = (
-            alpha.astype(np.uint8)
-            if alpha is not None
-            else np.full((h, w), 255, np.uint8)
-        )
-        mask = cheek_mask_alpha_fallback(rgb, alpha_u8)
+    crop = bone_rgb[y1:y2, x1:x2].copy()
+    if points is not None and landmarks is not None:
+        mask_full = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask_full, [points], 255)
+        if alpha is not None:
+            mask_full = cv2.bitwise_and(mask_full, _eroded_alpha_u8(alpha, h, w))
+        if CHEEK_MASK_FEATHER > 0:
+            k = CHEEK_MASK_FEATHER * 2 + 1
+            mask_full = cv2.GaussianBlur(mask_full, (k, k), CHEEK_MASK_FEATHER)
+        mask_crop = mask_full[y1:y2, x1:x2]
+        crop[mask_crop < 128] = 0
+        pixels = int((mask_crop >= 128).sum())
+    else:
+        eroded = _eroded_alpha_u8(alpha, h, w) if alpha is not None else np.full((h, w), 255, np.uint8)
+        mask_crop = eroded[y1:y2, x1:x2]
+        crop[mask_crop <= 100] = 0
+        pixels = int((mask_crop > 100).sum())
 
-    return mask, method
-
-
-def render_cheek_cutout(clean: Image.Image, cheek_mask: np.ndarray) -> Image.Image:
-    """Cheek pixels on black (QA preview, matches clinic reference layout)."""
-    rgb = np.array(clean.convert("RGB"))
-    out = np.zeros_like(rgb)
-    out[cheek_mask] = rgb[cheek_mask]
-    return Image.fromarray(out, mode="RGB")
+    return Image.fromarray(crop, mode="RGB"), method, pixels
 
 
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
@@ -1229,12 +1196,12 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
 
     if label in ANALYSIS_ANGLES:
         rgb = np.array(clean.convert("RGB"))
+        bone_rgb = np.array(visia.convert("RGB"))
         t_lm = datetime.now(timezone.utc)
         landmarks = detect_face_landmarks(rgb)
-        cheek_mask, cheek_method = build_right_90_cheek_mask(
-            rgb, alpha, landmarks
+        cheek_preview, cheek_method, cheek_pixels = extract_cheek_tight_bone(
+            bone_rgb, alpha, landmarks
         )
-        cheek_preview = render_cheek_cutout(clean, cheek_mask)
         cheek_url = upload_png(cheek_preview, f"cheek_{label}_{uid}.png")
         lm_ms = int(
             (datetime.now(timezone.utc) - t_lm).total_seconds() * 1000
@@ -1244,14 +1211,14 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
                 "analysis_step": "cheek_roi",
                 "cheek_roi_method": cheek_method,
                 "cheek_roi_image_url": cheek_url,
-                "cheek_pixel_count": int(cheek_mask.sum()),
+                "cheek_pixel_count": cheek_pixels,
                 "landmark_ms": lm_ms,
                 **compute_quality(clean, label),
             }
         )
         print(
             f"[handler] {label} cheek_roi method={cheek_method} "
-            f"pixels={cheek_mask.sum()} landmark_ms={lm_ms}"
+            f"pixels={cheek_pixels} landmark_ms={lm_ms}"
         )
 
     print(f"[handler] {label} OK")
