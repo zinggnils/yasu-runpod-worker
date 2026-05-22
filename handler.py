@@ -30,8 +30,8 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "scans")
 
 ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
-# Redness scoring: right profile only (single source of truth for severity).
-ANALYSIS_ANGLES = ("right_90",)
+# Redness scoring: both 90° profiles (edge fn averages Gemini scores).
+ANALYSIS_ANGLES = ("left_90", "right_90")
 PRIMARY_ANALYSIS_ANGLE = "right_90"
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
