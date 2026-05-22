@@ -82,43 +82,6 @@ def _init_matting():
 
 MATTING_SESSION = _init_matting()
 
-# ---------------------------------------------------------------------------
-# Phase 2 cheek fragment runs async via Supabase Edge Function (gemini-cheek-fragment)
-# ---------------------------------------------------------------------------
-
-
-def trigger_gemini_cheek_fragment(scan_id: str) -> None:
-    """Fire-and-forget: edge function reads visia_image_url and calls Gemini."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("[handler] skip gemini-cheek-fragment trigger (no Supabase config)")
-        return
-    url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/gemini-cheek-fragment"
-    # Prefer dedicated trigger secret; else project secret on apikey (sb_secret_… or legacy JWT).
-    trigger_secret = os.environ.get("YASU_FRAGMENT_TRIGGER_SECRET", "").strip()
-    apikey = trigger_secret or SUPABASE_SERVICE_KEY
-    headers = {
-        "apikey": apikey,
-        "Content-Type": "application/json",
-    }
-    key = SUPABASE_SERVICE_KEY.strip()
-    if key.startswith("eyJ") and not trigger_secret:
-        headers["Authorization"] = f"Bearer {key}"
-
-    try:
-        resp = requests.post(
-            url,
-            json={"scan_id": scan_id},
-            headers=headers,
-            timeout=15,
-        )
-        print(
-            f"[handler] gemini-cheek-fragment trigger scan_id={scan_id} "
-            f"http={resp.status_code} body={resp.text[:200]}"
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[handler] gemini-cheek-fragment trigger failed: {exc}")
-
-
 def _modnet_target_size(width: int, height: int) -> tuple[int, int]:
     """Resize to MODNET_INPUT_SIZE long edge, with both sides multiples of
     32 so MODNet's 5-stage downsample inside the network halves cleanly."""
@@ -1068,7 +1031,6 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         angle_data.update(
             {
                 "analysis_step": "visia_ready",
-                "cheek_fragment_status": "pending",
                 **compute_quality(clean, label),
             }
         )
@@ -1204,18 +1166,10 @@ def handler(job):
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary)
-        scoring_mode = os.environ.get("YASU_CHEEK_SCORING_MODE", "clean_filter").strip()
-        if scoring_mode == "clean_filter":
-            print(
-                f"[handler] DB visia_ready scan_id={scan_id} "
-                f"(cheek fragment skipped — {scoring_mode} uses score-cheek-filter)"
-            )
-        else:
-            trigger_gemini_cheek_fragment(scan_id)
-            print(
-                f"[handler] DB visia_ready scan_id={scan_id} "
-                f"triggered gemini-cheek-fragment"
-            )
+        print(
+            f"[handler] DB visia_ready scan_id={scan_id} "
+            f"(score-cheek-filter via check-job poll)"
+        )
 
     return {
         "status": "visia_ready",
