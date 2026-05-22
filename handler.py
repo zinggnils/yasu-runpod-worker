@@ -33,6 +33,15 @@ ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 # Redness scoring: both 90° profiles (edge fn averages Gemini scores).
 ANALYSIS_ANGLES = ("left_90", "right_90")
 PRIMARY_ANALYSIS_ANGLE = "right_90"
+PROFILE_90_ANGLES = ("right_90", "left_90")
+
+
+def resolve_primary_profile_angle(images: dict, image_paths: dict) -> str | None:
+    """Prefer right_90 for scan row thumbnails; allow left_90-only uploads."""
+    for label in PROFILE_90_ANGLES:
+        if image_paths.get(label) or images.get(label):
+            return label
+    return None
 # Inverted duotone analysis map (texture + pigmentation + acne scars).
 DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars"})
 PORTRAIT_WIDTH = 2160
@@ -1158,13 +1167,14 @@ def handler(job):
 
     if not isinstance(images, dict) or not isinstance(image_paths, dict):
         return {"error": "input.images and input.image_paths must be objects keyed by angle"}
-    if PRIMARY_ANALYSIS_ANGLE not in images and PRIMARY_ANALYSIS_ANGLE not in image_paths:
-        return {"error": f"Missing required {PRIMARY_ANALYSIS_ANGLE} image"}
+    primary_label = resolve_primary_profile_angle(images, image_paths)
+    if not primary_label:
+        return {"error": "Missing left_90 or right_90 profile image"}
     if (scan_id or image_paths) and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
     processed_angles = process_images(images, image_paths, mode)
-    primary = processed_angles.get(PRIMARY_ANALYSIS_ANGLE, {})
+    primary = processed_angles.get(primary_label, {})
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary)
