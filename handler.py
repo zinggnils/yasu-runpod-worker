@@ -1204,11 +1204,18 @@ def handler(job):
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary)
-        trigger_gemini_cheek_fragment(scan_id)
-        print(
-            f"[handler] DB visia_ready scan_id={scan_id} "
-            f"triggered gemini-cheek-fragment"
-        )
+        scoring_mode = os.environ.get("YASU_CHEEK_SCORING_MODE", "clean_filter").strip()
+        if scoring_mode == "clean_filter":
+            print(
+                f"[handler] DB visia_ready scan_id={scan_id} "
+                f"(cheek fragment skipped — {scoring_mode} uses score-cheek-filter)"
+            )
+        else:
+            trigger_gemini_cheek_fragment(scan_id)
+            print(
+                f"[handler] DB visia_ready scan_id={scan_id} "
+                f"triggered gemini-cheek-fragment"
+            )
 
     return {
         "status": "visia_ready",
