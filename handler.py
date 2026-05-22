@@ -33,6 +33,8 @@ ANGLE_KEYS = ["frontal", "left_45", "left_90", "right_45", "right_90"]
 # Redness scoring: both 90° profiles (edge fn averages Gemini scores).
 ANALYSIS_ANGLES = ("left_90", "right_90")
 PRIMARY_ANALYSIS_ANGLE = "right_90"
+# Inverted duotone analysis map (texture + pigmentation + acne scars).
+DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars"})
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
@@ -705,7 +707,7 @@ def make_analysis_map(
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(gray)
 
-    if mode == "texture":
+    if mode in DUOTONE_MODES:
         inv = 255 - contrast
         rgb = cv2.cvtColor(inv, cv2.COLOR_GRAY2RGB)
     else:
