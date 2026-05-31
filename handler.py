@@ -509,14 +509,15 @@ def fixed_analysis_crop(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
 
 
-# Fractions of the Haar face box that cover the visible cheek (upper-mid profile).
+# Fractions of the Haar face box — malar cheek pad only (strict; mirrors redness Gemini reference).
 _CHEEK_FRAC: dict[str, tuple[float, float, float, float]] = {
-    # right_90: cheek mound — avoid far-right ear/hair (was 0.36–1.0 → redness 0)
-    "right_90": (0.48, 0.26, 0.88, 0.68),
+    "right_90": (0.52, 0.28, 0.82, 0.66),
+    "left_90": (0.18, 0.28, 0.48, 0.66),
 }
 
-# Portrait fractions when Haar fails on right_90 (profile cheek sits center-right).
-_RIGHT90_FALLBACK_FRAC = (0.50, 0.24, 0.86, 0.58)
+# Portrait fractions when Haar fails (profile cheek, nose/ear excluded).
+_RIGHT90_FALLBACK_FRAC = (0.52, 0.26, 0.82, 0.56)
+_LEFT90_FALLBACK_FRAC = (0.18, 0.26, 0.48, 0.56)
 
 
 def _clamp_box(l: int, t: int, r: int, b: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -583,7 +584,18 @@ def _crop_box_to_analysis(
 
 def right_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
     """Fixed cheek region for right 90° when Haar misses (better than dead center)."""
-    lf, tf, rf, bf = _RIGHT90_FALLBACK_FRAC
+    return _profile_fallback_box(img_w, img_h, _RIGHT90_FALLBACK_FRAC)
+
+
+def left_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
+    """Fixed cheek region for left 90° when Haar misses."""
+    return _profile_fallback_box(img_w, img_h, _LEFT90_FALLBACK_FRAC)
+
+
+def _profile_fallback_box(
+    img_w: int, img_h: int, frac: tuple[float, float, float, float]
+) -> tuple[int, int, int, int]:
+    lf, tf, rf, bf = frac
     l = int(img_w * lf)
     r = int(img_w * rf)
     t = int(img_h * tf)
@@ -609,6 +621,9 @@ def analysis_roi_crop(
     if label == "right_90":
         l, t, r, b = right_profile_fallback_box(w, h)
         return _crop_box_to_analysis(img, alpha, l, t, r, b, "right_profile_fallback")
+    if label == "left_90":
+        l, t, r, b = left_profile_fallback_box(w, h)
+        return _crop_box_to_analysis(img, alpha, l, t, r, b, "left_profile_fallback")
 
     crop = fixed_analysis_crop(img)
     left = (w - ANALYSIS_CROP_SIZE) // 2
