@@ -912,6 +912,7 @@ def commit_refined_angle(
     offset_y: int,
     scale: float,
     processed_angles: dict,
+    scan_mode: str = "redness",
 ) -> dict:
     """Bake manual offset into the refined image and replace processed_angles[label]."""
     img = _download_processed_url(refined_url)
@@ -922,8 +923,14 @@ def commit_refined_angle(
     else:
         clean_url = upload_webp_visual(shifted, f"clean_{label}_{uid}.webp", quality=95)
 
+    mode = scan_mode if scan_mode in ("redness", "texture", "pigmentation", "acne_scars", "before_after") else "redness"
+    visia = make_analysis_map(shifted, mode, alpha=None)
+    visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+
     prev = dict(processed_angles.get(label) or {})
     prev["clean_image_url"] = clean_url
+    prev["visia_image_url"] = visia_url
+    prev["redness_image_url"] = visia_url
     prev["refined_at"] = datetime.now(timezone.utc).isoformat()
     prev["refine_offset_x"] = int(offset_x)
     prev["refine_offset_y"] = int(offset_y)
@@ -1159,8 +1166,16 @@ def handler(job):
             return {"error": "commit_refine requires scan_id, angle, refined_url"}
         if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
             raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+        scan_mode = str(job_input.get("scan_mode") or "redness")
         angle_data = commit_refined_angle(
-            scan_id, label, refined_url, offset_x, offset_y, scale, processed_angles
+            scan_id,
+            label,
+            refined_url,
+            offset_x,
+            offset_y,
+            scale,
+            processed_angles,
+            scan_mode=scan_mode,
         )
         update_supabase_processed_angle(scan_id, label, angle_data, processed_angles)
         print(f"[handler] commit_refine OK scan_id={scan_id} angle={label}")
