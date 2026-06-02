@@ -773,14 +773,16 @@ def load_angle_image(images: dict, image_paths: dict, label: str) -> tuple[Image
     return None, None
 
 
-def update_supabase_scan(scan_id: str, processed_angles: dict, primary: dict) -> None:
+def update_supabase_scan(
+    scan_id: str, processed_angles: dict, primary: dict, mode: str = "redness"
+) -> None:
     url = f"{SUPABASE_URL}/rest/v1/scans?id=eq.{scan_id}"
     body = {
-        "status": "visia_ready",
+        "status": "done" if mode == "before_after" else "visia_ready",
         "processed_angles": processed_angles,
         "clean_image_url": primary.get("clean_image_url"),
-        "redness_image_url": primary.get("visia_image_url"),
-        "image_url": primary.get("visia_image_url"),
+        "redness_image_url": None if mode == "before_after" else primary.get("visia_image_url"),
+        "image_url": None if mode == "before_after" else primary.get("visia_image_url"),
         "redness_severity": None,
     }
     resp = requests.patch(
@@ -918,7 +920,7 @@ def commit_refined_angle(
     img = _download_processed_url(refined_url)
     shifted = apply_refine_transform(img, int(offset_x), int(offset_y), float(scale))
     uid = uuid.uuid4().hex[:10]
-    if label in ANALYSIS_ANGLES:
+    if label in ANALYSIS_ANGLES and visia is not None:
         clean_url = upload_webp_lossless(shifted, f"clean_{label}_{uid}.webp")
     else:
         clean_url = upload_webp_visual(shifted, f"clean_{label}_{uid}.webp", quality=95)
@@ -1044,14 +1046,17 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     alpha = prepared["alpha"]
     original_url = prepared["original_url"]
 
-    visia = make_analysis_map(clean, mode, alpha=alpha)
+    visia = None if mode == "before_after" else make_analysis_map(clean, mode, alpha=alpha)
 
     if label in ANALYSIS_ANGLES:
         visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
-    else:
+    elif visia is not None:
         clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
         visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+    else:
+        clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
+        visia_url = None
 
     angle_data: dict = {
         "original_image_url": original_url,
@@ -1207,10 +1212,9 @@ def handler(job):
     primary = processed_angles.get(primary_label, {})
 
     if scan_id:
-        update_supabase_scan(scan_id, processed_angles, primary)
+        update_supabase_scan(scan_id, processed_angles, primary, mode)
         print(
-            f"[handler] DB visia_ready scan_id={scan_id} "
-            f"(score-cheek-filter via check-job poll)"
+            f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id}"
         )
 
     return {
