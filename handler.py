@@ -920,14 +920,16 @@ def commit_refined_angle(
     img = _download_processed_url(refined_url)
     shifted = apply_refine_transform(img, int(offset_x), int(offset_y), float(scale))
     uid = uuid.uuid4().hex[:10]
+
+    mode = scan_mode if scan_mode in ("redness", "texture", "pigmentation", "acne_scars", "before_after") else "redness"
+    visia = None if mode == "before_after" else make_analysis_map(shifted, mode, alpha=None)
+
     if label in ANALYSIS_ANGLES and visia is not None:
         clean_url = upload_webp_lossless(shifted, f"clean_{label}_{uid}.webp")
     else:
         clean_url = upload_webp_visual(shifted, f"clean_{label}_{uid}.webp", quality=95)
 
-    mode = scan_mode if scan_mode in ("redness", "texture", "pigmentation", "acne_scars", "before_after") else "redness"
-    visia = make_analysis_map(shifted, mode, alpha=None)
-    visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+    visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92) if visia is not None else None
 
     prev = dict(processed_angles.get(label) or {})
     prev["clean_image_url"] = clean_url
