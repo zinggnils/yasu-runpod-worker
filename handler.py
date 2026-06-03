@@ -1055,7 +1055,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
 
     visia = None if mode == "before_after" else make_analysis_map(clean, mode, alpha=alpha)
 
-    if label in ANALYSIS_ANGLES:
+    if label in ANALYSIS_ANGLES and visia is not None:
         visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     elif visia is not None:
@@ -1072,7 +1072,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         "background_removed": alpha is not None,
     }
 
-    if label in ANALYSIS_ANGLES:
+    if label in ANALYSIS_ANGLES and visia_url is not None:
         angle_data.update(
             {
                 "analysis_step": "visia_ready",
