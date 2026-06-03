@@ -800,6 +800,19 @@ def update_supabase_scan(
         raise RuntimeError(f"DB update failed: {resp.status_code} {resp.text[:200]}")
 
 
+def update_supabase_scan_partial(
+    scan_id: str, processed_angles: dict, mode: str = "before_after"
+) -> None:
+    """Expose clean images as soon as each before/after angle is ready."""
+    primary = processed_angles.get(PRIMARY_ANALYSIS_ANGLE, {})
+    if not primary:
+        primary = next(
+            (row for row in processed_angles.values() if row.get("clean_image_url")),
+            {},
+        )
+    update_supabase_scan(scan_id, processed_angles, primary, mode)
+
+
 def update_supabase_scan_studio(scan_id: str, studio_angles: dict) -> None:
     """Write the editor-refine results back to the scan row.
 
@@ -1072,7 +1085,9 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     return label, angle_data
 
 
-def process_images(images: dict, image_paths: dict, mode: str = "redness") -> dict:
+def process_images(
+    images: dict, image_paths: dict, mode: str = "redness", scan_id: str | None = None
+) -> dict:
     """Two-phase pipeline:
 
     Phase 1 (sequential): per angle — download original, normalize to the
@@ -1087,6 +1102,32 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
     """
     uid = uuid.uuid4().hex[:10]
     prepared_angles: list[dict] = []
+    processed: dict = {}
+
+    if mode == "before_after" and scan_id:
+        for label in ANGLE_KEYS:
+            original, original_url = load_angle_image(images, image_paths, label)
+            if original is None:
+                continue
+            portrait = normalize_portrait(original)
+            clean, alpha = remove_background_and_finish(portrait)
+            print(
+                f"[handler] {label} matting "
+                + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
+            )
+            encoded_label, data = _encode_and_upload(
+                {
+                    "label": label,
+                    "original_url": original_url,
+                    "clean": clean,
+                    "alpha": alpha,
+                },
+                mode,
+                uid,
+            )
+            processed[encoded_label] = data
+            update_supabase_scan_partial(scan_id, processed, mode)
+        return processed
 
     for label in ANGLE_KEYS:
         original, original_url = load_angle_image(images, image_paths, label)
@@ -1107,7 +1148,6 @@ def process_images(images: dict, image_paths: dict, mode: str = "redness") -> di
             + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
         )
 
-    processed: dict = {}
     if not prepared_angles:
         return processed
 
@@ -1202,7 +1242,7 @@ def handler(job):
     if (scan_id or image_paths) and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
-    processed_angles = process_images(images, image_paths, mode)
+    processed_angles = process_images(images, image_paths, mode, scan_id=scan_id)
     primary = processed_angles.get(primary_label, {})
 
     if scan_id:
