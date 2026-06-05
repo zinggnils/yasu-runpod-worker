@@ -1111,6 +1111,7 @@ def process_images(
                 continue
             portrait = normalize_portrait(original)
             clean, alpha = remove_background_and_finish(portrait)
+            clean = refine_studio_quality(clean)
             print(
                 f"[handler] {label} matting "
                 + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
@@ -1135,6 +1136,7 @@ def process_images(
             continue
         portrait = normalize_portrait(original)
         clean, alpha = remove_background_and_finish(portrait)
+        clean = refine_studio_quality(clean)
         prepared_angles.append(
             {
                 "label": label,
