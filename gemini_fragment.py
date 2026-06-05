@@ -46,7 +46,7 @@ Only clean the image presentation:
 - remove the background completely
 - make the background pure clean black, including around hair edges
 - keep the person natural and realistic
-- make the result slightly cleaner and a bit darker only where needed to remove background spill
+- keep the original exposure and skin brightness; do not darken the subject
 - recenter the head to the center of the image
 - do not beautify, retouch, smooth skin, remove wrinkles, remove redness, or alter any facial detail
 
