@@ -44,8 +44,8 @@ def resolve_primary_profile_angle(images: dict, image_paths: dict) -> str | None
         if image_paths.get(label) or images.get(label):
             return label
     return None
-# Inverted duotone analysis map (texture, pigmentation, acne scars, redness).
-DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars", "redness"})
+# Inverted duotone analysis map (texture, pigmentation, acne scars, redness, before/after documentation).
+DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars", "redness", "before_after"})
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
@@ -783,8 +783,8 @@ def update_supabase_scan(
         "status": "done" if mode == "before_after" else "visia_ready",
         "processed_angles": processed_angles,
         "clean_image_url": primary.get("clean_image_url"),
-        "redness_image_url": None if mode == "before_after" else primary.get("visia_image_url"),
-        "image_url": None if mode == "before_after" else primary.get("visia_image_url"),
+        "redness_image_url": primary.get("visia_image_url"),
+        "image_url": primary.get("visia_image_url"),
         "redness_severity": None,
     }
     resp = requests.patch(
@@ -1064,7 +1064,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     alpha = prepared["alpha"]
     original_url = prepared["original_url"]
 
-    visia = None if mode == "before_after" else make_analysis_map(clean, mode, alpha=alpha)
+    visia = make_analysis_map(clean, mode, alpha=alpha)
 
     if label in ANALYSIS_ANGLES and visia is not None:
         visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
