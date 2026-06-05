@@ -39,6 +39,19 @@ COMPOSITION:
   crop it out entirely — shrink the shape inward until only
   featureless skin texture remains"""
 
+GEMINI_REFINE_PROMPT = """Don't change the face, identity, expression, facial features, skin texture,
+hair shape, or clinical appearance.
+
+Only clean the image presentation:
+- remove the background completely
+- make the background pure clean black, including around hair edges
+- keep the person natural and realistic
+- make the result slightly cleaner and a bit darker only where needed to remove background spill
+- recenter the head to the center of the image
+- do not beautify, retouch, smooth skin, remove wrinkles, remove redness, or alter any facial detail
+
+Return one clean portrait image only."""
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 GEMINI_FRAGMENT_MODEL = os.environ.get(
     "GEMINI_FRAGMENT_MODEL", "gemini-2.5-flash-image"
@@ -154,3 +167,54 @@ def run_gemini_fragment(visia: Image.Image) -> tuple[Image.Image | None, str | N
                 Image.open(BytesIO(inline.data)).convert("RGB")
             ), None
     return None, "no image part"
+
+
+def run_gemini_refine(img: Image.Image) -> tuple[Image.Image | None, str | None]:
+    """Gemini image edit for clean black background + centered head."""
+    if not GEMINI_API_KEY:
+        return None, "GEMINI_API_KEY not set"
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        return None, f"google-genai not installed: {exc}"
+
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+
+    http_options = types.HttpOptions(timeout=GEMINI_FRAGMENT_TIMEOUT_S * 1000)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        temperature=0.15,
+        image_config=types.ImageConfig(image_size=GEMINI_FRAGMENT_IMAGE_SIZE),
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_FRAGMENT_MODEL,
+            contents=[
+                types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
+                GEMINI_REFINE_PROMPT,
+            ],
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Gemini API error: {exc}"
+
+    if not response.candidates:
+        return None, "Gemini returned no candidates"
+
+    for part in response.candidates[0].content.parts:
+        inline = getattr(part, "inline_data", None)
+        if inline is not None and inline.data:
+            return Image.open(BytesIO(inline.data)).convert("RGB"), None
+        try:
+            out = part.as_image()
+            if out is not None:
+                return out.convert("RGB"), None
+        except Exception:  # noqa: BLE001
+            pass
+
+    return None, "Gemini response had no image part"

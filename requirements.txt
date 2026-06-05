@@ -4,3 +4,4 @@ pillow
 pillow-heif
 opencv-python-headless==4.10.0.84
 onnxruntime==1.17.1
+google-genai

@@ -24,6 +24,8 @@ try:
 except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
+from gemini_fragment import run_gemini_refine
+
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -858,7 +860,14 @@ def _refine_one_angle(
         return label, {"studio_image_url": None, "error": "missing source url"}
 
     img = _download_processed_url(source_url)
-    cleaned = refine_studio_quality(img)
+    gemini_refined, gemini_error = run_gemini_refine(img)
+    if gemini_refined is not None:
+        cleaned = gemini_refined
+        refine_method = "gemini_refine"
+    else:
+        print(f"[refine] {label} Gemini fallback: {gemini_error}")
+        cleaned = refine_studio_quality(img)
+        refine_method = "local_refine"
 
     if halo_only:
         out = cleaned
@@ -873,11 +882,13 @@ def _refine_one_angle(
             framing = f"face@{bbox}"
 
     studio_url = upload_webp_lossless(out, f"studio_{label}_{uid}.webp")
-    print(f"[refine] {label} OK framing={framing}")
+    print(f"[refine] {label} OK method={refine_method} framing={framing}")
     return label, {
         "studio_image_url": studio_url,
         "source_clean_url": source_url,
         "framing": framing,
+        "refine_method": refine_method,
+        "refine_error": gemini_error if gemini_refined is None else None,
     }
 
 
