@@ -1263,6 +1263,27 @@ def handler(job):
         print(
             f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id}"
         )
+        # Trigger scoring pipeline asynchronously — run-pipeline handles Gemini scoring.
+        # before_after is already done; all other modes need scoring.
+        if mode != "before_after":
+            import threading
+            def _trigger_pipeline():
+                try:
+                    fn_url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/run-pipeline"
+                    requests.post(
+                        fn_url,
+                        headers={
+                            "apikey": SUPABASE_SERVICE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"scan_id": scan_id},
+                        timeout=300,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[handler] run-pipeline trigger failed: {exc}")
+            threading.Thread(target=_trigger_pipeline, daemon=True).start()
+            print(f"[handler] run-pipeline triggered scan_id={scan_id}")
 
     return {
         "status": "visia_ready",
