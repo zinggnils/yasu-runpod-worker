@@ -1313,15 +1313,6 @@ def handler(job):
             except Exception as exc:  # noqa: BLE001
                 print(f"[handler] {slug} trigger failed: {exc}")
 
-        # Web JPEG: Gemini background removal after MODNet (before_after + analysis modes).
-        if pipeline == "web":
-            threading.Thread(
-                target=_post_function,
-                args=("process-web-clean", 600),
-                daemon=True,
-            ).start()
-            print(f"[handler] process-web-clean triggered scan_id={scan_id}")
-
         # Trigger scoring pipeline asynchronously — run-pipeline handles Gemini scoring.
         # before_after is already done; all other modes need scoring.
         if mode != "before_after":
