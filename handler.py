@@ -453,13 +453,8 @@ def _matte_and_composite(img_rgb: Image.Image, *, enhance: bool) -> tuple[Image.
 
 
 def remove_background_and_finish(img_rgb: Image.Image):
-    """Mobile / HEIC: MODNet + composite + clarity/sharpen (SHARPEN_AMOUNT)."""
+    """MODNet + composite + clarity/sharpen (SHARPEN_AMOUNT)."""
     return _matte_and_composite(img_rgb, enhance=True)
-
-
-def remove_background_neutral(img_rgb: Image.Image):
-    """Web / JPEG: MODNet + composite only — no color or sharpness enhancement."""
-    return _matte_and_composite(img_rgb, enhance=False)
 
 
 def decode_image(image_b64: str) -> Image.Image:
@@ -1052,12 +1047,12 @@ def update_supabase_processed_angle(
         raise RuntimeError(f"Processed angle update failed: {resp.status_code} {resp.text[:200]}")
 
 
-def _encode_and_upload(prepared: dict, mode: str, uid: str, pipeline: str = "mobile") -> tuple[str, dict]:
+def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     """I/O- and CPU-bound work that runs in parallel across angles.
 
     `prepared` carries everything matting/normalize already produced; this
-    stage only does false-color rendering, WebP/JPEG encoding, and storage
-    uploads — all libwebp/libjpeg/requests calls drop the GIL so a
+    stage only does false-color rendering, WebP encoding, and storage
+    uploads — all libwebp/requests calls drop the GIL so a
     ThreadPoolExecutor gives real parallelism here.
     """
     label = prepared["label"]
@@ -1066,25 +1061,15 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str, pipeline: str = "mob
     original_url = prepared["original_url"]
 
     visia = make_analysis_map(clean, mode, alpha=alpha)
-    web_jpeg = pipeline == "web"
 
     if label in ANALYSIS_ANGLES and visia is not None:
         visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
-        if web_jpeg:
-            clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg", quality=95)
-        else:
-            clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
+        clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     elif visia is not None:
-        if web_jpeg:
-            clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg", quality=95)
-        else:
-            clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
+        clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
         visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
     else:
-        if web_jpeg:
-            clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg", quality=95)
-        else:
-            clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
+        clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
         visia_url = None
 
     angle_data: dict = {
@@ -1093,9 +1078,6 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str, pipeline: str = "mob
         "visia_image_url": visia_url,
         "background_removed": alpha is not None,
     }
-    if web_jpeg:
-        angle_data["pipeline"] = "web_neutral"
-        angle_data["refine_method"] = "runpod_neutral_jpeg"
 
     if label in ANALYSIS_ANGLES and visia_url is not None:
         angle_data.update(
@@ -1115,7 +1097,6 @@ def process_images(
     image_paths: dict,
     mode: str = "redness",
     scan_id: str | None = None,
-    pipeline: str = "mobile",
 ) -> dict:
     """Two-phase pipeline:
 
@@ -1125,15 +1106,13 @@ def process_images(
         cores via ORT's intra-op pool; running multiple inferences
         concurrently would thrash, so we serialize this phase.
 
-    Phase 2 (parallel): build the false-color visia map, encode WebP/JPEG,
+    Phase 2 (parallel): build the false-color visia map, encode WebP,
         and upload to Supabase Storage. All of these release the GIL during
-        native libwebp/libjpeg/requests calls, so threads actually overlap.
+        native libwebp/requests calls, so threads actually overlap.
     """
     uid = uuid.uuid4().hex[:10]
     prepared_angles: list[dict] = []
     processed: dict = {}
-    web_pipeline = pipeline == "web"
-    matte_fn = remove_background_neutral if web_pipeline else remove_background_and_finish
 
     if mode == "before_after" and scan_id:
         for label in ANGLE_KEYS:
@@ -1141,9 +1120,8 @@ def process_images(
             if original is None:
                 continue
             portrait = normalize_portrait(original)
-            clean, alpha = matte_fn(portrait)
-            if not web_pipeline:
-                clean = refine_studio_quality(clean)
+            clean, alpha = remove_background_and_finish(portrait)
+            clean = refine_studio_quality(clean)
             print(
                 f"[handler] {label} matting "
                 + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
@@ -1157,7 +1135,6 @@ def process_images(
                 },
                 mode,
                 uid,
-                pipeline,
             )
             processed[encoded_label] = data
             update_supabase_scan_partial(scan_id, processed, mode)
@@ -1168,9 +1145,8 @@ def process_images(
         if original is None:
             continue
         portrait = normalize_portrait(original)
-        clean, alpha = matte_fn(portrait)
-        if not web_pipeline:
-            clean = refine_studio_quality(clean)
+        clean, alpha = remove_background_and_finish(portrait)
+        clean = refine_studio_quality(clean)
         prepared_angles.append(
             {
                 "label": label,
@@ -1189,7 +1165,7 @@ def process_images(
 
     with ThreadPoolExecutor(max_workers=len(prepared_angles)) as pool:
         futures = [
-            pool.submit(_encode_and_upload, item, mode, uid, pipeline) for item in prepared_angles
+            pool.submit(_encode_and_upload, item, mode, uid) for item in prepared_angles
         ]
         for fut in futures:
             label, data = fut.result()
@@ -1280,13 +1256,8 @@ def handler(job):
     if (scan_id or image_paths) and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
-    pipeline = str(job_input.get("pipeline") or "mobile")
-    if pipeline not in ("mobile", "web"):
-        pipeline = "mobile"
-    print(f"[handler] pipeline={pipeline}")
-
     processed_angles = process_images(
-        images, image_paths, mode, scan_id=scan_id, pipeline=pipeline
+        images, image_paths, mode, scan_id=scan_id
     )
     primary = processed_angles.get(primary_label, {})
 
