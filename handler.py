@@ -44,8 +44,8 @@ def resolve_primary_profile_angle(images: dict, image_paths: dict) -> str | None
         if image_paths.get(label) or images.get(label):
             return label
     return None
-# Inverted duotone analysis map (texture, pigmentation, acne scars, redness, before/after documentation).
-DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars", "redness", "before_after"})
+# Inverted duotone analysis map (texture, pigmentation, acne scars, redness).
+DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars", "redness"})
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
@@ -435,8 +435,7 @@ def _clarity_and_sharpen(img: Image.Image) -> Image.Image:
 def _matte_and_composite(img_rgb: Image.Image, *, enhance: bool) -> tuple[Image.Image, np.ndarray | None]:
     """MODNet matte + guided filter + studio finish + black composite.
 
-    When enhance=False (web JPEG pipeline), skip clarity/sharpen so colors stay
-    identical to the clinical upload — only background removal runs.
+    When enhance=True, apply clarity/sharpen after compositing on black.
     """
     alpha = run_matting(img_rgb)
     if alpha is None:
@@ -453,13 +452,8 @@ def _matte_and_composite(img_rgb: Image.Image, *, enhance: bool) -> tuple[Image.
 
 
 def remove_background_and_finish(img_rgb: Image.Image):
-    """Mobile / HEIC: MODNet + composite + clarity/sharpen (SHARPEN_AMOUNT)."""
+    """MODNet + composite + clarity/sharpen (SHARPEN_AMOUNT)."""
     return _matte_and_composite(img_rgb, enhance=True)
-
-
-def remove_background_neutral(img_rgb: Image.Image):
-    """Web / JPEG: MODNet + composite only — no color or sharpness enhancement."""
-    return _matte_and_composite(img_rgb, enhance=False)
 
 
 def decode_image(image_b64: str) -> Image.Image:
@@ -512,15 +506,14 @@ def fixed_analysis_crop(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
 
 
-# Fractions of the Haar face box — malar cheek pad only (strict; mirrors redness Gemini reference).
+# Fractions of the Haar face box that cover the visible cheek (upper-mid profile).
 _CHEEK_FRAC: dict[str, tuple[float, float, float, float]] = {
-    "right_90": (0.52, 0.28, 0.82, 0.66),
-    "left_90": (0.18, 0.28, 0.48, 0.66),
+    # right_90: cheek mound — avoid far-right ear/hair (was 0.36–1.0 → redness 0)
+    "right_90": (0.48, 0.26, 0.88, 0.68),
 }
 
-# Portrait fractions when Haar fails (profile cheek, nose/ear excluded).
-_RIGHT90_FALLBACK_FRAC = (0.52, 0.26, 0.82, 0.56)
-_LEFT90_FALLBACK_FRAC = (0.18, 0.26, 0.48, 0.56)
+# Portrait fractions when Haar fails on right_90 (profile cheek sits center-right).
+_RIGHT90_FALLBACK_FRAC = (0.50, 0.24, 0.86, 0.58)
 
 
 def _clamp_box(l: int, t: int, r: int, b: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -587,18 +580,7 @@ def _crop_box_to_analysis(
 
 def right_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
     """Fixed cheek region for right 90° when Haar misses (better than dead center)."""
-    return _profile_fallback_box(img_w, img_h, _RIGHT90_FALLBACK_FRAC)
-
-
-def left_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
-    """Fixed cheek region for left 90° when Haar misses."""
-    return _profile_fallback_box(img_w, img_h, _LEFT90_FALLBACK_FRAC)
-
-
-def _profile_fallback_box(
-    img_w: int, img_h: int, frac: tuple[float, float, float, float]
-) -> tuple[int, int, int, int]:
-    lf, tf, rf, bf = frac
+    lf, tf, rf, bf = _RIGHT90_FALLBACK_FRAC
     l = int(img_w * lf)
     r = int(img_w * rf)
     t = int(img_h * tf)
@@ -624,9 +606,6 @@ def analysis_roi_crop(
     if label == "right_90":
         l, t, r, b = right_profile_fallback_box(w, h)
         return _crop_box_to_analysis(img, alpha, l, t, r, b, "right_profile_fallback")
-    if label == "left_90":
-        l, t, r, b = left_profile_fallback_box(w, h)
-        return _crop_box_to_analysis(img, alpha, l, t, r, b, "left_profile_fallback")
 
     crop = fixed_analysis_crop(img)
     left = (w - ANALYSIS_CROP_SIZE) // 2
@@ -1052,12 +1031,12 @@ def update_supabase_processed_angle(
         raise RuntimeError(f"Processed angle update failed: {resp.status_code} {resp.text[:200]}")
 
 
-def _encode_and_upload(prepared: dict, mode: str, uid: str, pipeline: str = "mobile") -> tuple[str, dict]:
+def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     """I/O- and CPU-bound work that runs in parallel across angles.
 
     `prepared` carries everything matting/normalize already produced; this
-    stage only does false-color rendering, WebP/JPEG encoding, and storage
-    uploads — all libwebp/libjpeg/requests calls drop the GIL so a
+    stage only does false-color rendering, WebP encoding, and storage
+    uploads — all libwebp/requests calls drop the GIL so a
     ThreadPoolExecutor gives real parallelism here.
     """
     label = prepared["label"]
@@ -1065,27 +1044,18 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str, pipeline: str = "mob
     alpha = prepared["alpha"]
     original_url = prepared["original_url"]
 
-    visia = make_analysis_map(clean, mode, alpha=alpha)
-    web_jpeg = pipeline == "web"
+    visia = None if mode == "before_after" else make_analysis_map(clean, mode, alpha=alpha)
 
-    if label in ANALYSIS_ANGLES and visia is not None:
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
-        if web_jpeg:
-            clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg", quality=95)
-        else:
-            clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
-    elif visia is not None:
-        if web_jpeg:
-            clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg", quality=95)
-        else:
-            clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+    if label in ANALYSIS_ANGLES:
+        visia_url = (
+            upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+            if visia is not None
+            else None
+        )
+        clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     else:
-        if web_jpeg:
-            clean_url = upload_jpeg(clean, f"clean_{label}_{uid}.jpg", quality=95)
-        else:
-            clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
-        visia_url = None
+        clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
+        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92) if visia is not None else None
 
     angle_data: dict = {
         "original_image_url": original_url,
@@ -1093,9 +1063,6 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str, pipeline: str = "mob
         "visia_image_url": visia_url,
         "background_removed": alpha is not None,
     }
-    if web_jpeg:
-        angle_data["pipeline"] = "web_neutral"
-        angle_data["refine_method"] = "runpod_neutral_jpeg"
 
     if label in ANALYSIS_ANGLES and visia_url is not None:
         angle_data.update(
@@ -1115,7 +1082,6 @@ def process_images(
     image_paths: dict,
     mode: str = "redness",
     scan_id: str | None = None,
-    pipeline: str = "mobile",
 ) -> dict:
     """Two-phase pipeline:
 
@@ -1125,15 +1091,13 @@ def process_images(
         cores via ORT's intra-op pool; running multiple inferences
         concurrently would thrash, so we serialize this phase.
 
-    Phase 2 (parallel): build the false-color visia map, encode WebP/JPEG,
+    Phase 2 (parallel): build the false-color visia map, encode WebP,
         and upload to Supabase Storage. All of these release the GIL during
-        native libwebp/libjpeg/requests calls, so threads actually overlap.
+        native libwebp/requests calls, so threads actually overlap.
     """
     uid = uuid.uuid4().hex[:10]
     prepared_angles: list[dict] = []
     processed: dict = {}
-    web_pipeline = pipeline == "web"
-    matte_fn = remove_background_neutral if web_pipeline else remove_background_and_finish
 
     if mode == "before_after" and scan_id:
         for label in ANGLE_KEYS:
@@ -1141,9 +1105,7 @@ def process_images(
             if original is None:
                 continue
             portrait = normalize_portrait(original)
-            clean, alpha = matte_fn(portrait)
-            if not web_pipeline:
-                clean = refine_studio_quality(clean)
+            clean, alpha = remove_background_and_finish(portrait)
             print(
                 f"[handler] {label} matting "
                 + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
@@ -1157,7 +1119,6 @@ def process_images(
                 },
                 mode,
                 uid,
-                pipeline,
             )
             processed[encoded_label] = data
             update_supabase_scan_partial(scan_id, processed, mode)
@@ -1168,9 +1129,7 @@ def process_images(
         if original is None:
             continue
         portrait = normalize_portrait(original)
-        clean, alpha = matte_fn(portrait)
-        if not web_pipeline:
-            clean = refine_studio_quality(clean)
+        clean, alpha = remove_background_and_finish(portrait)
         prepared_angles.append(
             {
                 "label": label,
@@ -1189,7 +1148,7 @@ def process_images(
 
     with ThreadPoolExecutor(max_workers=len(prepared_angles)) as pool:
         futures = [
-            pool.submit(_encode_and_upload, item, mode, uid, pipeline) for item in prepared_angles
+            pool.submit(_encode_and_upload, item, mode, uid) for item in prepared_angles
         ]
         for fut in futures:
             label, data = fut.result()
@@ -1280,48 +1239,17 @@ def handler(job):
     if (scan_id or image_paths) and (not SUPABASE_URL or not SUPABASE_SERVICE_KEY):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
-    pipeline = str(job_input.get("pipeline") or "mobile")
-    if pipeline not in ("mobile", "web"):
-        pipeline = "mobile"
-    print(f"[handler] pipeline={pipeline}")
-
     processed_angles = process_images(
-        images, image_paths, mode, scan_id=scan_id, pipeline=pipeline
+        images, image_paths, mode, scan_id=scan_id
     )
     primary = processed_angles.get(primary_label, {})
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary, mode)
         print(
-            f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id}"
+            f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id} "
+            f"(scoring via check-job poll)"
         )
-        import threading
-
-        def _post_function(slug: str, timeout: int = 300) -> None:
-            try:
-                fn_url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/{slug}"
-                requests.post(
-                    fn_url,
-                    headers={
-                        "apikey": SUPABASE_SERVICE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"scan_id": scan_id},
-                    timeout=timeout,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[handler] {slug} trigger failed: {exc}")
-
-        # Trigger scoring pipeline asynchronously — run-pipeline handles Gemini scoring.
-        # before_after is already done; all other modes need scoring.
-        if mode != "before_after":
-            threading.Thread(
-                target=_post_function,
-                args=("run-pipeline", 300),
-                daemon=True,
-            ).start()
-            print(f"[handler] run-pipeline triggered scan_id={scan_id}")
 
     return {
         "status": "visia_ready",
