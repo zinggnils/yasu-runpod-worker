@@ -1031,31 +1031,52 @@ def update_supabase_processed_angle(
         raise RuntimeError(f"Processed angle update failed: {resp.status_code} {resp.text[:200]}")
 
 
-def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
+def _encode_and_upload(prepared: dict, mode: str, uid: str, modes: list[str] | None = None) -> tuple[str, dict]:
     """I/O- and CPU-bound work that runs in parallel across angles.
 
     `prepared` carries everything matting/normalize already produced; this
     stage only does false-color rendering, WebP encoding, and storage
     uploads — all libwebp/requests calls drop the GIL so a
     ThreadPoolExecutor gives real parallelism here.
+
+    When `modes` has multiple analysis targets, each angle stores a
+    `visia_maps` dict keyed by mode plus `visia_image_url` for the primary.
     """
     label = prepared["label"]
     clean = prepared["clean"]
     alpha = prepared["alpha"]
     original_url = prepared["original_url"]
+    analysis_modes = [m for m in (modes or [mode]) if m != "before_after"]
+    primary_mode = analysis_modes[0] if analysis_modes else mode
 
-    visia = None if mode == "before_after" else make_analysis_map(clean, mode, alpha=alpha)
+    visia_maps: dict[str, str | None] = {}
+    primary_visia_url: str | None = None
+
+    if mode == "before_after" or not analysis_modes:
+        visia = None
+    elif len(analysis_modes) == 1:
+        visia = make_analysis_map(clean, analysis_modes[0], alpha=alpha)
+        if visia is not None:
+            visia_maps[analysis_modes[0]] = upload_jpeg(
+                visia, f"visia_{label}_{analysis_modes[0]}_{uid}.jpg", quality=92
+            )
+        primary_visia_url = visia_maps.get(analysis_modes[0])
+    else:
+        for m in analysis_modes:
+            visia = make_analysis_map(clean, m, alpha=alpha)
+            visia_maps[m] = (
+                upload_jpeg(visia, f"visia_{label}_{m}_{uid}.jpg", quality=92)
+                if visia is not None
+                else None
+            )
+        primary_visia_url = visia_maps.get(primary_mode)
 
     if label in ANALYSIS_ANGLES:
-        visia_url = (
-            upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
-            if visia is not None
-            else None
-        )
+        visia_url = primary_visia_url
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
     else:
         clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92) if visia is not None else None
+        visia_url = primary_visia_url
 
     angle_data: dict = {
         "original_image_url": original_url,
@@ -1063,6 +1084,8 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
         "visia_image_url": visia_url,
         "background_removed": alpha is not None,
     }
+    if visia_maps:
+        angle_data["visia_maps"] = visia_maps
 
     if label in ANALYSIS_ANGLES and visia_url is not None:
         angle_data.update(
@@ -1077,11 +1100,42 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     return label, angle_data
 
 
+def _angles_for_mode(processed_angles: dict, mode: str) -> dict:
+    """Copy processed angles with visia_image_url set for a specific mode."""
+    out: dict = {}
+    for label, row in processed_angles.items():
+        data = dict(row)
+        visia_maps = data.get("visia_maps") or {}
+        if isinstance(visia_maps, dict) and mode in visia_maps:
+            data["visia_image_url"] = visia_maps.get(mode)
+        out[label] = data
+    return out
+
+
+def sync_linked_scans(
+    linked_scan_ids: dict,
+    processed_angles: dict,
+    primary_label: str,
+) -> None:
+    """Write mode-specific visia maps to linked capture rows."""
+    if not linked_scan_ids or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    for mode, linked_id in linked_scan_ids.items():
+        angles = _angles_for_mode(processed_angles, mode)
+        primary = angles.get(primary_label) or next(
+            (row for row in angles.values() if row.get("clean_image_url")),
+            {},
+        )
+        update_supabase_scan(linked_id, angles, primary, mode)
+        print(f"[handler] synced linked scan mode={mode} id={linked_id}")
+
+
 def process_images(
     images: dict,
     image_paths: dict,
     mode: str = "redness",
     scan_id: str | None = None,
+    modes: list[str] | None = None,
 ) -> dict:
     """Two-phase pipeline:
 
@@ -1098,6 +1152,8 @@ def process_images(
     uid = uuid.uuid4().hex[:10]
     prepared_angles: list[dict] = []
     processed: dict = {}
+    analysis_modes = [m for m in (modes or [mode]) if m != "before_after"]
+    effective_mode = mode if mode == "before_after" or not analysis_modes else analysis_modes[0]
 
     if mode == "before_after" and scan_id:
         for label in ANGLE_KEYS:
@@ -1148,7 +1204,8 @@ def process_images(
 
     with ThreadPoolExecutor(max_workers=len(prepared_angles)) as pool:
         futures = [
-            pool.submit(_encode_and_upload, item, mode, uid) for item in prepared_angles
+            pool.submit(_encode_and_upload, item, effective_mode, uid, analysis_modes or [mode])
+            for item in prepared_angles
         ]
         for fut in futures:
             label, data = fut.result()
@@ -1161,6 +1218,13 @@ def handler(job):
     job_input = job.get("input", {})
     scan_id = job_input.get("scan_id")
     mode = job_input.get("mode", "redness")
+    modes_raw = job_input.get("modes")
+    modes = (
+        [str(m) for m in modes_raw if str(m) != "before_after"]
+        if isinstance(modes_raw, list) and modes_raw
+        else None
+    )
+    linked_scan_ids = job_input.get("linked_scan_ids") or {}
 
     # ---- Editor refine mode -------------------------------------------------
     # Triggered by the "Open in Editor" button. Takes the already-processed
@@ -1227,7 +1291,7 @@ def handler(job):
     image_paths = job_input.get("image_paths") or {}
 
     print(
-        f"[handler] mode={mode} scan_id={scan_id} "
+        f"[handler] mode={mode} modes={modes or [mode]} scan_id={scan_id} "
         f"image_paths={list(image_paths.keys())} images={list(images.keys())}"
     )
 
@@ -1240,12 +1304,14 @@ def handler(job):
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
     processed_angles = process_images(
-        images, image_paths, mode, scan_id=scan_id
+        images, image_paths, mode, scan_id=scan_id, modes=modes
     )
     primary = processed_angles.get(primary_label, {})
 
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary, mode)
+        if isinstance(linked_scan_ids, dict) and linked_scan_ids:
+            sync_linked_scans(linked_scan_ids, processed_angles, primary_label)
         print(
             f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id} "
             f"(scoring via check-job poll)"
