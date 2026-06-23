@@ -44,8 +44,9 @@ def resolve_primary_profile_angle(images: dict, image_paths: dict) -> str | None
         if image_paths.get(label) or images.get(label):
             return label
     return None
-# Inverted duotone analysis map (texture, pigmentation, acne scars, redness, before/after documentation).
-DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars", "redness", "before_after"})
+# Inverted duotone analysis map (texture + pigmentation + acne scars).
+# Redness uses VISIA BONE colormap — restored May-30 processing.
+DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars"})
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
@@ -435,8 +436,7 @@ def _clarity_and_sharpen(img: Image.Image) -> Image.Image:
 def _matte_and_composite(img_rgb: Image.Image, *, enhance: bool) -> tuple[Image.Image, np.ndarray | None]:
     """MODNet matte + guided filter + studio finish + black composite.
 
-    When enhance=False (web JPEG pipeline), skip clarity/sharpen so colors stay
-    identical to the clinical upload — only background removal runs.
+    When enhance=True, apply clarity/sharpen after compositing on black.
     """
     alpha = run_matting(img_rgb)
     if alpha is None:
@@ -507,15 +507,14 @@ def fixed_analysis_crop(img: Image.Image) -> Image.Image:
     return img.crop((left, top, left + ANALYSIS_CROP_SIZE, top + ANALYSIS_CROP_SIZE))
 
 
-# Fractions of the Haar face box — malar cheek pad only (strict; mirrors redness Gemini reference).
+# Fractions of the Haar face box that cover the visible cheek (upper-mid profile).
 _CHEEK_FRAC: dict[str, tuple[float, float, float, float]] = {
-    "right_90": (0.52, 0.28, 0.82, 0.66),
-    "left_90": (0.18, 0.28, 0.48, 0.66),
+    # right_90: cheek mound — avoid far-right ear/hair (was 0.36–1.0 → redness 0)
+    "right_90": (0.48, 0.26, 0.88, 0.68),
 }
 
-# Portrait fractions when Haar fails (profile cheek, nose/ear excluded).
-_RIGHT90_FALLBACK_FRAC = (0.52, 0.26, 0.82, 0.56)
-_LEFT90_FALLBACK_FRAC = (0.18, 0.26, 0.48, 0.56)
+# Portrait fractions when Haar fails on right_90 (profile cheek sits center-right).
+_RIGHT90_FALLBACK_FRAC = (0.50, 0.24, 0.86, 0.58)
 
 
 def _clamp_box(l: int, t: int, r: int, b: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -582,18 +581,7 @@ def _crop_box_to_analysis(
 
 def right_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
     """Fixed cheek region for right 90° when Haar misses (better than dead center)."""
-    return _profile_fallback_box(img_w, img_h, _RIGHT90_FALLBACK_FRAC)
-
-
-def left_profile_fallback_box(img_w: int, img_h: int) -> tuple[int, int, int, int]:
-    """Fixed cheek region for left 90° when Haar misses."""
-    return _profile_fallback_box(img_w, img_h, _LEFT90_FALLBACK_FRAC)
-
-
-def _profile_fallback_box(
-    img_w: int, img_h: int, frac: tuple[float, float, float, float]
-) -> tuple[int, int, int, int]:
-    lf, tf, rf, bf = frac
+    lf, tf, rf, bf = _RIGHT90_FALLBACK_FRAC
     l = int(img_w * lf)
     r = int(img_w * rf)
     t = int(img_h * tf)
@@ -619,9 +607,6 @@ def analysis_roi_crop(
     if label == "right_90":
         l, t, r, b = right_profile_fallback_box(w, h)
         return _crop_box_to_analysis(img, alpha, l, t, r, b, "right_profile_fallback")
-    if label == "left_90":
-        l, t, r, b = left_profile_fallback_box(w, h)
-        return _crop_box_to_analysis(img, alpha, l, t, r, b, "left_profile_fallback")
 
     crop = fixed_analysis_crop(img)
     left = (w - ANALYSIS_CROP_SIZE) // 2
@@ -1060,17 +1045,18 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str) -> tuple[str, dict]:
     alpha = prepared["alpha"]
     original_url = prepared["original_url"]
 
-    visia = make_analysis_map(clean, mode, alpha=alpha)
+    visia = None if mode == "before_after" else make_analysis_map(clean, mode, alpha=alpha)
 
-    if label in ANALYSIS_ANGLES and visia is not None:
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+    if label in ANALYSIS_ANGLES:
+        visia_url = (
+            upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
+            if visia is not None
+            else None
+        )
         clean_url = upload_webp_lossless(clean, f"clean_{label}_{uid}.webp")
-    elif visia is not None:
-        clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
-        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92)
     else:
         clean_url = upload_webp_visual(clean, f"clean_{label}_{uid}.webp", quality=95)
-        visia_url = None
+        visia_url = upload_jpeg(visia, f"visia_{label}_{uid}.jpg", quality=92) if visia is not None else None
 
     angle_data: dict = {
         "original_image_url": original_url,
@@ -1121,7 +1107,6 @@ def process_images(
                 continue
             portrait = normalize_portrait(original)
             clean, alpha = remove_background_and_finish(portrait)
-            clean = refine_studio_quality(clean)
             print(
                 f"[handler] {label} matting "
                 + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
@@ -1146,7 +1131,6 @@ def process_images(
             continue
         portrait = normalize_portrait(original)
         clean, alpha = remove_background_and_finish(portrait)
-        clean = refine_studio_quality(clean)
         prepared_angles.append(
             {
                 "label": label,
@@ -1264,35 +1248,9 @@ def handler(job):
     if scan_id:
         update_supabase_scan(scan_id, processed_angles, primary, mode)
         print(
-            f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id}"
+            f"[handler] DB {'done' if mode == 'before_after' else 'visia_ready'} scan_id={scan_id} "
+            f"(scoring via check-job poll)"
         )
-        import threading
-
-        def _post_function(slug: str, timeout: int = 300) -> None:
-            try:
-                fn_url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/{slug}"
-                requests.post(
-                    fn_url,
-                    headers={
-                        "apikey": SUPABASE_SERVICE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"scan_id": scan_id},
-                    timeout=timeout,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[handler] {slug} trigger failed: {exc}")
-
-        # Trigger scoring pipeline asynchronously — run-pipeline handles Gemini scoring.
-        # before_after is already done; all other modes need scoring.
-        if mode != "before_after":
-            threading.Thread(
-                target=_post_function,
-                args=("run-pipeline", 300),
-                daemon=True,
-            ).start()
-            print(f"[handler] run-pipeline triggered scan_id={scan_id}")
 
     return {
         "status": "visia_ready",
