@@ -44,9 +44,8 @@ def resolve_primary_profile_angle(images: dict, image_paths: dict) -> str | None
         if image_paths.get(label) or images.get(label):
             return label
     return None
-# Inverted duotone analysis map (texture + pigmentation + acne scars).
-# Redness uses VISIA BONE colormap — restored May-30 processing.
-DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars"})
+# Inverted duotone analysis map (texture, pigmentation, acne scars, redness).
+DUOTONE_MODES = frozenset({"texture", "pigmentation", "acne_scars", "redness"})
 PORTRAIT_WIDTH = 2160
 PORTRAIT_HEIGHT = 2700
 ANALYSIS_CROP_SIZE = 1000
