@@ -24,7 +24,7 @@ try:
 except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
-from gemini_fragment import run_gemini_refine, run_gemini_remove_face_shadows
+from gemini_fragment import run_gemini_refine
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -67,11 +67,6 @@ MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
 # subtle midtone clarity + UnsharpMask makes pores/skin texture pop without
 # halos around facial features.
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
-GEMINI_DESHADOW_ENABLED = os.environ.get("GEMINI_DESHADOW", "true").lower() not in (
-    "0",
-    "false",
-    "no",
-)
 
 
 def _init_matting():
@@ -459,18 +454,6 @@ def _matte_and_composite(img_rgb: Image.Image, *, enhance: bool) -> tuple[Image.
 def remove_background_and_finish(img_rgb: Image.Image):
     """MODNet + composite + clarity/sharpen (SHARPEN_AMOUNT)."""
     return _matte_and_composite(img_rgb, enhance=True)
-
-
-def apply_face_shadow_removal(clean: Image.Image, label: str) -> Image.Image:
-    """Gemini pass after matting: remove cast shadows on the face, then continue pipeline."""
-    if not GEMINI_DESHADOW_ENABLED:
-        return clean
-    deshadowed, err = run_gemini_remove_face_shadows(clean)
-    if deshadowed is not None:
-        print(f"[handler] {label} face deshadow OK")
-        return deshadowed
-    print(f"[handler] {label} face deshadow skipped: {err}")
-    return clean
 
 
 def decode_image(image_b64: str) -> Image.Image:
@@ -1179,7 +1162,6 @@ def process_images(
                 continue
             portrait = normalize_portrait(original)
             clean, alpha = remove_background_and_finish(portrait)
-            clean = apply_face_shadow_removal(clean, label)
             print(
                 f"[handler] {label} matting "
                 + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
@@ -1204,7 +1186,6 @@ def process_images(
             continue
         portrait = normalize_portrait(original)
         clean, alpha = remove_background_and_finish(portrait)
-        clean = apply_face_shadow_removal(clean, label)
         prepared_angles.append(
             {
                 "label": label,
