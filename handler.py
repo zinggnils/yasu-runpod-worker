@@ -25,7 +25,7 @@ except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
 from enhancement_pipeline import run_enhancement_pipeline
-from gemini_fragment import GEMINI_API_KEY, run_gemini_initial_clean
+from gemini_fragment import GEMINI_API_KEY, _alpha_from_black_background, run_gemini_initial_clean
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -74,6 +74,7 @@ CLEAN_METHOD = os.environ.get(
     "CLEAN_METHOD",
     "gemini" if GEMINI_API_KEY else "modnet",
 ).strip().lower()
+GEMINI_CLEAN_MAX_WORKERS = int(os.environ.get("GEMINI_CLEAN_MAX_WORKERS", "2"))
 
 
 def _init_matting():
@@ -466,12 +467,13 @@ def remove_background_and_finish(img_rgb: Image.Image):
 def clean_portrait(img_rgb: Image.Image) -> tuple[Image.Image, np.ndarray | None, str]:
     """Initial scan clean — Gemini image-edit (default) or MODNet fallback."""
     if CLEAN_METHOD == "gemini":
-        cleaned, alpha, err = run_gemini_initial_clean(img_rgb)
+        cleaned, err = run_gemini_initial_clean(img_rgb)
         if cleaned is not None:
             if cleaned.size != (PORTRAIT_WIDTH, PORTRAIT_HEIGHT):
                 cleaned = cleaned.resize(
                     (PORTRAIT_WIDTH, PORTRAIT_HEIGHT), Image.Resampling.LANCZOS
                 )
+            alpha = _alpha_from_black_background(cleaned)
             return cleaned, alpha, "gemini_initial_clean"
         print(f"[handler] Gemini clean failed ({err}); falling back to MODNet")
 
@@ -744,7 +746,11 @@ def make_analysis_map(
         rgb = cv2.cvtColor(bone, cv2.COLOR_BGR2RGB)
 
     if alpha is not None:
-        a = alpha.astype(np.float32) / 255.0
+        a = alpha.astype(np.float32)
+        if a.max() > 1.0:
+            a = a / 255.0
+        if a.shape[:2] != rgb.shape[:2]:
+            a = cv2.resize(a, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
         rgb = (rgb.astype(np.float32) * a[..., None]).astype(np.uint8)
     return Image.fromarray(rgb)
 
@@ -1241,7 +1247,9 @@ def process_images(
             update_supabase_scan_partial(scan_id, processed, mode)
         return processed
 
-    phase1_workers = min(4, len(ANGLE_KEYS)) if CLEAN_METHOD == "gemini" else 1
+    phase1_workers = (
+        min(GEMINI_CLEAN_MAX_WORKERS, len(ANGLE_KEYS)) if CLEAN_METHOD == "gemini" else 1
+    )
     with ThreadPoolExecutor(max_workers=phase1_workers) as pool:
         futures = [
             pool.submit(_prepare_angle, label, images, image_paths)
@@ -1256,13 +1264,15 @@ def process_images(
         return processed
 
     with ThreadPoolExecutor(max_workers=len(prepared_angles)) as pool:
-        futures = [
-            pool.submit(_encode_and_upload, item, effective_mode, uid, analysis_modes or [mode])
+        futures = {
+            pool.submit(_encode_and_upload, item, effective_mode, uid, analysis_modes or [mode]): item
             for item in prepared_angles
-        ]
+        }
         for fut in futures:
             label, data = fut.result()
             processed[label] = data
+            if scan_id and mode != "before_after":
+                update_supabase_scan_partial(scan_id, processed, effective_mode)
 
     return processed
 

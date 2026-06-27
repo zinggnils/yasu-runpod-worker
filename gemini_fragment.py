@@ -75,9 +75,10 @@ GEMINI_FRAGMENT_MODEL = os.environ.get(
     "GEMINI_FRAGMENT_MODEL", GEMINI_CLEAN_MODEL
 )
 GEMINI_FRAGMENT_IMAGE_SIZE = os.environ.get("GEMINI_FRAGMENT_IMAGE_SIZE", "1K")
-GEMINI_CLEAN_IMAGE_SIZE = os.environ.get("GEMINI_CLEAN_IMAGE_SIZE", "")
+GEMINI_CLEAN_IMAGE_SIZE = os.environ.get("GEMINI_CLEAN_IMAGE_SIZE", "1K")
+GEMINI_CLEAN_INPUT_MAX = int(os.environ.get("GEMINI_CLEAN_INPUT_MAX", "1280"))
 GEMINI_FRAGMENT_TIMEOUT_S = int(os.environ.get("GEMINI_FRAGMENT_TIMEOUT_S", "150"))
-GEMINI_CLEAN_TIMEOUT_S = int(os.environ.get("GEMINI_CLEAN_TIMEOUT_S", "180"))
+GEMINI_CLEAN_TIMEOUT_S = int(os.environ.get("GEMINI_CLEAN_TIMEOUT_S", "90"))
 
 
 def _alpha_from_black_background(rgb: Image.Image) -> np.ndarray:
@@ -110,21 +111,32 @@ def _gemini_image_config(types):
     return None
 
 
+def _downscale_for_api(img: Image.Image, max_edge: int) -> Image.Image:
+    """Smaller API input = faster Gemini round-trips."""
+    w, h = img.size
+    if max(w, h) <= max_edge:
+        return img
+    scale = max_edge / float(max(w, h))
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    return img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+
 def run_gemini_initial_clean(
     img: Image.Image,
-) -> tuple[Image.Image | None, np.ndarray | None, str | None]:
+) -> tuple[Image.Image | None, str | None]:
     """Initial scan clean: Gemini image-edit for shadow removal + black background."""
     if not GEMINI_API_KEY:
-        return None, None, "GEMINI_API_KEY not set"
+        return None, "GEMINI_API_KEY not set"
 
     try:
         from google import genai
         from google.genai import types
     except ImportError as exc:
-        return None, None, f"google-genai not installed: {exc}"
+        return None, f"google-genai not installed: {exc}"
 
+    api_img = _downscale_for_api(img, GEMINI_CLEAN_INPUT_MAX)
     buf = BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+    api_img.convert("RGB").save(buf, format="JPEG", quality=88, optimize=True)
 
     http_options = types.HttpOptions(timeout=GEMINI_CLEAN_TIMEOUT_S * 1000)
     client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
@@ -148,14 +160,13 @@ def run_gemini_initial_clean(
             config=config,
         )
     except Exception as exc:  # noqa: BLE001
-        return None, None, f"Gemini API error: {exc}"
+        return None, f"Gemini API error: {exc}"
 
     out = _extract_image_part(response)
     if out is None:
-        return None, None, "Gemini response had no image part"
+        return None, "Gemini response had no image part"
 
-    alpha = _alpha_from_black_background(out)
-    return out, alpha, None
+    return out, None
 
 
 def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:
