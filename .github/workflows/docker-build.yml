@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "handler.py"
+      - "gemini_fragment.py"
       - "requirements.txt"
       - "Dockerfile"
 
