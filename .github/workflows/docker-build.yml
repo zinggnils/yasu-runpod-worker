@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths:
       - "handler.py"
-      - "shadow_enhance.py"
+      - "enhancement_pipeline.py"
+      - "shadowformer_infer.py"
       - "requirements.txt"
       - "Dockerfile"
 
