@@ -52,12 +52,110 @@ Only clean the image presentation:
 
 Return one clean portrait image only."""
 
+# Initial scan clean: shadow normalization + black background in one edit.
+GEMINI_INITIAL_CLEAN_PROMPT = os.environ.get(
+    "GEMINI_INITIAL_CLEAN_PROMPT",
+    """Remove harsh shadows from the face. Level the lighting across the face so skin tone is even and natural, while preserving pores and skin texture.
+
+Remove the background completely and replace it with pure black (#000000). Clean precisely around hair edges.
+
+Preserve exactly:
+- identity, expression, facial features, hair, and clinical skin appearance
+- natural colors — no beautification, smoothing, retouching, or plastic skin
+
+Return one clean portrait on pure black only.""",
+)
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+GEMINI_CLEAN_MODEL = os.environ.get(
+    "GEMINI_CLEAN_MODEL",
+    os.environ.get("GEMINI_REFINE_MODEL", "gemini-2.5-flash-image"),
+)
 GEMINI_FRAGMENT_MODEL = os.environ.get(
-    "GEMINI_FRAGMENT_MODEL", "gemini-2.5-flash-image"
+    "GEMINI_FRAGMENT_MODEL", GEMINI_CLEAN_MODEL
 )
 GEMINI_FRAGMENT_IMAGE_SIZE = os.environ.get("GEMINI_FRAGMENT_IMAGE_SIZE", "1K")
+GEMINI_CLEAN_IMAGE_SIZE = os.environ.get("GEMINI_CLEAN_IMAGE_SIZE", "")
 GEMINI_FRAGMENT_TIMEOUT_S = int(os.environ.get("GEMINI_FRAGMENT_TIMEOUT_S", "150"))
+GEMINI_CLEAN_TIMEOUT_S = int(os.environ.get("GEMINI_CLEAN_TIMEOUT_S", "180"))
+
+
+def _alpha_from_black_background(rgb: Image.Image) -> np.ndarray:
+    """Derive soft alpha from a pure-black-background clinical portrait."""
+    arr = np.array(rgb.convert("RGB"))
+    alpha = arr.max(axis=2).astype(np.float32) / 255.0
+    mask = np.clip((alpha - 0.04) / 0.96, 0.0, 1.0)
+    return cv2.GaussianBlur(mask, (0, 0), sigmaX=2.5)
+
+
+def _extract_image_part(response) -> Image.Image | None:
+    if not response.candidates:
+        return None
+    for part in response.candidates[0].content.parts:
+        inline = getattr(part, "inline_data", None)
+        if inline is not None and inline.data:
+            return Image.open(BytesIO(inline.data)).convert("RGB")
+        try:
+            out = part.as_image()
+            if out is not None:
+                return out.convert("RGB")
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _gemini_image_config(types):
+    if GEMINI_CLEAN_IMAGE_SIZE in ("1K", "2K"):
+        return types.ImageConfig(image_size=GEMINI_CLEAN_IMAGE_SIZE)
+    return None
+
+
+def run_gemini_initial_clean(
+    img: Image.Image,
+) -> tuple[Image.Image | None, np.ndarray | None, str | None]:
+    """Initial scan clean: Gemini image-edit for shadow removal + black background."""
+    if not GEMINI_API_KEY:
+        return None, None, "GEMINI_API_KEY not set"
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        return None, None, f"google-genai not installed: {exc}"
+
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+
+    http_options = types.HttpOptions(timeout=GEMINI_CLEAN_TIMEOUT_S * 1000)
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=http_options)
+
+    config_kwargs: dict = {
+        "response_modalities": ["IMAGE"],
+        "temperature": 0,
+    }
+    image_cfg = _gemini_image_config(types)
+    if image_cfg is not None:
+        config_kwargs["image_config"] = image_cfg
+    config = types.GenerateContentConfig(**config_kwargs)
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_CLEAN_MODEL,
+            contents=[
+                types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
+                GEMINI_INITIAL_CLEAN_PROMPT,
+            ],
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, None, f"Gemini API error: {exc}"
+
+    out = _extract_image_part(response)
+    if out is None:
+        return None, None, "Gemini response had no image part"
+
+    alpha = _alpha_from_black_background(out)
+    return out, alpha, None
 
 
 def _keep_largest_fragment(rgb: Image.Image) -> Image.Image:

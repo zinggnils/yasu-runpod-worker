@@ -25,6 +25,7 @@ except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
 from enhancement_pipeline import run_enhancement_pipeline
+from gemini_fragment import GEMINI_API_KEY, run_gemini_initial_clean
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -67,6 +68,12 @@ MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
 # subtle midtone clarity + UnsharpMask makes pores/skin texture pop without
 # halos around facial features.
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
+
+# Initial clean: gemini (shadow + bg via image-edit model) or modnet fallback.
+CLEAN_METHOD = os.environ.get(
+    "CLEAN_METHOD",
+    "gemini" if GEMINI_API_KEY else "modnet",
+).strip().lower()
 
 
 def _init_matting():
@@ -454,6 +461,22 @@ def _matte_and_composite(img_rgb: Image.Image, *, enhance: bool) -> tuple[Image.
 def remove_background_and_finish(img_rgb: Image.Image):
     """MODNet + composite + clarity/sharpen (SHARPEN_AMOUNT)."""
     return _matte_and_composite(img_rgb, enhance=True)
+
+
+def clean_portrait(img_rgb: Image.Image) -> tuple[Image.Image, np.ndarray | None, str]:
+    """Initial scan clean — Gemini image-edit (default) or MODNet fallback."""
+    if CLEAN_METHOD == "gemini":
+        cleaned, alpha, err = run_gemini_initial_clean(img_rgb)
+        if cleaned is not None:
+            if cleaned.size != (PORTRAIT_WIDTH, PORTRAIT_HEIGHT):
+                cleaned = cleaned.resize(
+                    (PORTRAIT_WIDTH, PORTRAIT_HEIGHT), Image.Resampling.LANCZOS
+                )
+            return cleaned, alpha, "gemini_initial_clean"
+        print(f"[handler] Gemini clean failed ({err}); falling back to MODNet")
+
+    clean, alpha = _matte_and_composite(img_rgb, enhance=True)
+    return clean, alpha, "modnet"
 
 
 def decode_image(image_b64: str) -> Image.Image:
@@ -1077,6 +1100,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str, modes: list[str] | N
     clean = prepared["clean"]
     alpha = prepared["alpha"]
     original_url = prepared["original_url"]
+    clean_method = prepared.get("clean_method", CLEAN_METHOD)
     analysis_modes = [m for m in (modes or [mode]) if m != "before_after"]
     primary_mode = analysis_modes[0] if analysis_modes else mode
 
@@ -1114,6 +1138,7 @@ def _encode_and_upload(prepared: dict, mode: str, uid: str, modes: list[str] | N
         "clean_image_url": clean_url,
         "visia_image_url": visia_url,
         "background_removed": alpha is not None,
+        "clean_method": clean_method,
     }
     if visia_maps:
         angle_data["visia_maps"] = visia_maps
@@ -1161,6 +1186,26 @@ def sync_linked_scans(
         print(f"[handler] synced linked scan mode={mode} id={linked_id}")
 
 
+def _prepare_angle(label: str, images: dict, image_paths: dict) -> dict | None:
+    """Download, normalize, and clean one angle."""
+    original, original_url = load_angle_image(images, image_paths, label)
+    if original is None:
+        return None
+    portrait = normalize_portrait(original)
+    clean, alpha, clean_method = clean_portrait(portrait)
+    print(
+        f"[handler] {label} clean method={clean_method} "
+        + ("alpha OK" if alpha is not None else "no alpha")
+    )
+    return {
+        "label": label,
+        "original_url": original_url,
+        "clean": clean,
+        "alpha": alpha,
+        "clean_method": clean_method,
+    }
+
+
 def process_images(
     images: dict,
     image_paths: dict,
@@ -1170,15 +1215,10 @@ def process_images(
 ) -> dict:
     """Two-phase pipeline:
 
-    Phase 1 (sequential): per angle — download original, normalize to the
-        portrait frame, run MODNet matting + guided-filter refine + studio
-        finish + Clarity/UnsharpMask. MODNet on CPU already saturates all
-        cores via ORT's intra-op pool; running multiple inferences
-        concurrently would thrash, so we serialize this phase.
+    Phase 1: per angle — download, normalize, Gemini clean (shadow+bg) or MODNet.
+        Gemini API calls run in parallel (I/O bound); MODNet stays serial on CPU.
 
-    Phase 2 (parallel): build the false-color visia map, encode WebP,
-        and upload to Supabase Storage. All of these release the GIL during
-        native libwebp/requests calls, so threads actually overlap.
+    Phase 2 (parallel): false-color visia map, WebP encode, Supabase upload.
     """
     uid = uuid.uuid4().hex[:10]
     prepared_angles: list[dict] = []
@@ -1188,47 +1228,29 @@ def process_images(
 
     if mode == "before_after" and scan_id:
         for label in ANGLE_KEYS:
-            original, original_url = load_angle_image(images, image_paths, label)
-            if original is None:
+            prepared = _prepare_angle(label, images, image_paths)
+            if prepared is None:
                 continue
-            portrait = normalize_portrait(original)
-            clean, alpha = remove_background_and_finish(portrait)
-            print(
-                f"[handler] {label} matting "
-                + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
-            )
             encoded_label, data = _encode_and_upload(
-                {
-                    "label": label,
-                    "original_url": original_url,
-                    "clean": clean,
-                    "alpha": alpha,
-                },
+                prepared,
                 mode,
                 uid,
             )
+            data["clean_method"] = prepared.get("clean_method")
             processed[encoded_label] = data
             update_supabase_scan_partial(scan_id, processed, mode)
         return processed
 
-    for label in ANGLE_KEYS:
-        original, original_url = load_angle_image(images, image_paths, label)
-        if original is None:
-            continue
-        portrait = normalize_portrait(original)
-        clean, alpha = remove_background_and_finish(portrait)
-        prepared_angles.append(
-            {
-                "label": label,
-                "original_url": original_url,
-                "clean": clean,
-                "alpha": alpha,
-            }
-        )
-        print(
-            f"[handler] {label} matting "
-            + ("OK" if alpha is not None else "SKIPPED (no MODNet model)")
-        )
+    phase1_workers = min(4, len(ANGLE_KEYS)) if CLEAN_METHOD == "gemini" else 1
+    with ThreadPoolExecutor(max_workers=phase1_workers) as pool:
+        futures = [
+            pool.submit(_prepare_angle, label, images, image_paths)
+            for label in ANGLE_KEYS
+        ]
+        for fut in futures:
+            prepared = fut.result()
+            if prepared is not None:
+                prepared_angles.append(prepared)
 
     if not prepared_angles:
         return processed
