@@ -24,7 +24,7 @@ try:
 except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
-from gemini_fragment import run_gemini_refine
+from shadow_enhance import remove_face_shadows
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -840,14 +840,9 @@ def _refine_one_angle(
         return label, {"studio_image_url": None, "error": "missing source url"}
 
     img = _download_processed_url(source_url)
-    gemini_refined, gemini_error = run_gemini_refine(img)
-    if gemini_refined is not None:
-        cleaned = gemini_refined
-        refine_method = "gemini_refine"
-    else:
-        print(f"[refine] {label} Gemini fallback: {gemini_error}")
-        cleaned = refine_studio_quality(img)
-        refine_method = "local_refine"
+    enhanced = remove_face_shadows(img)
+    cleaned = refine_studio_quality(enhanced)
+    refine_method = "runpod_shadow_enhance"
 
     if halo_only:
         out = cleaned
@@ -868,7 +863,7 @@ def _refine_one_angle(
         "source_clean_url": source_url,
         "framing": framing,
         "refine_method": refine_method,
-        "refine_error": gemini_error if gemini_refined is None else None,
+        "refine_error": None,
     }
 
 
@@ -937,6 +932,43 @@ def commit_refined_angle(
     prev["refine_offset_y"] = int(offset_y)
     prev["refine_scale"] = float(scale)
     return prev
+
+
+def refine_editor_angle(
+    scan_id: str,
+    label: str,
+    source_url: str,
+    processed_angles: dict,
+    scan_mode: str = "redness",
+) -> dict:
+    """Editor Refine: local shadow removal + halo cleanup for one angle."""
+    if not source_url:
+        raise RuntimeError("missing source clean_image_url")
+
+    img = _download_processed_url(source_url)
+    enhanced = remove_face_shadows(img)
+    cleaned = refine_studio_quality(enhanced)
+    uid = uuid.uuid4().hex[:10]
+
+    if label in ANALYSIS_ANGLES:
+        clean_url = upload_webp_lossless(cleaned, f"clean_{label}_{uid}.webp")
+    else:
+        clean_url = upload_webp_visual(cleaned, f"clean_{label}_{uid}.webp", quality=95)
+
+    prev = dict(processed_angles.get(label) or {})
+    prev["clean_image_url"] = clean_url
+    prev["refined_at"] = datetime.now(timezone.utc).isoformat()
+    prev["refine_method"] = "runpod_shadow_enhance"
+    prev["gemini_refine_status"] = "done"
+    prev["gemini_refine_error"] = None
+    update_supabase_processed_angle(scan_id, label, prev, processed_angles)
+    print(f"[refine_angle] {label} OK scan_id={scan_id}")
+    return {
+        "status": "saved",
+        "scan_id": scan_id,
+        "angle": label,
+        "clean_image_url": clean_url,
+    }
 
 
 def process_refine(scan_id: str, clean_urls: dict, *, halo_only: bool = True) -> dict:
@@ -1230,6 +1262,24 @@ def handler(job):
     # Triggered by the "Open in Editor" button. Takes the already-processed
     # clean_image_urls from the initial scan and runs studio-grade halo
     # cleanup + canonical face placement on each angle.
+    if mode == "refine_angle":
+        label = job_input.get("angle")
+        source_url = job_input.get("clean_image_url")
+        processed_angles = job_input.get("processed_angles") or {}
+        if not scan_id or not label or not source_url:
+            return {"error": "refine_angle requires scan_id, angle, clean_image_url"}
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+        scan_mode = str(job_input.get("scan_mode") or "redness")
+        print(f"[handler] mode=refine_angle scan_id={scan_id} angle={label}")
+        return refine_editor_angle(
+            scan_id,
+            label,
+            source_url,
+            processed_angles,
+            scan_mode=scan_mode,
+        )
+
     if mode == "refine":
         clean_urls = job_input.get("clean_image_urls") or {}
         if not scan_id or not clean_urls:
