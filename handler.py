@@ -24,7 +24,7 @@ try:
 except ImportError:  # Allows local helper tests without RunPod installed.
     runpod = None
 
-from shadow_enhance import remove_face_shadows
+from enhancement_pipeline import run_enhancement_pipeline
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -840,9 +840,8 @@ def _refine_one_angle(
         return label, {"studio_image_url": None, "error": "missing source url"}
 
     img = _download_processed_url(source_url)
-    enhanced = remove_face_shadows(img)
+    enhanced, refine_method = run_enhancement_pipeline(img)
     cleaned = refine_studio_quality(enhanced)
-    refine_method = "runpod_shadow_enhance"
 
     if halo_only:
         out = cleaned
@@ -946,7 +945,7 @@ def refine_editor_angle(
         raise RuntimeError("missing source clean_image_url")
 
     img = _download_processed_url(source_url)
-    enhanced = remove_face_shadows(img)
+    enhanced, refine_method = run_enhancement_pipeline(img)
     cleaned = refine_studio_quality(enhanced)
     uid = uuid.uuid4().hex[:10]
 
@@ -958,7 +957,7 @@ def refine_editor_angle(
     prev = dict(processed_angles.get(label) or {})
     prev["clean_image_url"] = clean_url
     prev["refined_at"] = datetime.now(timezone.utc).isoformat()
-    prev["refine_method"] = "runpod_shadow_enhance"
+    prev["refine_method"] = refine_method
     prev["gemini_refine_status"] = "done"
     prev["gemini_refine_error"] = None
     update_supabase_processed_angle(scan_id, label, prev, processed_angles)
