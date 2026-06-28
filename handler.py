@@ -232,9 +232,11 @@ def _studio_finish_alpha(alpha: np.ndarray) -> np.ndarray:
 # the chin, matching the framing of a passport / studio portrait.
 STD_FACE_HEIGHT_FRAC = float(os.environ.get("STD_FACE_HEIGHT_FRAC", "0.45"))
 STD_FACE_TOP_FRAC = float(os.environ.get("STD_FACE_TOP_FRAC", "0.20"))
+# Editor Refine button: 0.5 = half the halo-cleanup strength (tunable via env).
+EDITOR_REFINE_STRENGTH = float(os.environ.get("EDITOR_REFINE_STRENGTH", "0.5"))
 
 
-def refine_studio_quality(img_rgb: Image.Image) -> Image.Image:
+def refine_studio_quality(img_rgb: Image.Image, *, strength: float = 1.0) -> Image.Image:
     """Second-pass halo cleanup on an already-processed black-bg image.
 
     The processed image is `original_rgb * alpha` composited onto pure
@@ -284,7 +286,14 @@ def refine_studio_quality(img_rgb: Image.Image) -> Image.Image:
     af = af * af * (3.0 - 2.0 * af)
     arr = arr * af[..., None]
 
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+    out_arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if strength >= 1.0:
+        return Image.fromarray(out_arr, mode="RGB")
+    if strength <= 0.0:
+        return img_rgb
+    orig = np.array(img_rgb.convert("RGB")).astype(np.float32)
+    blended = orig + (out_arr.astype(np.float32) - orig) * float(strength)
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
 
 
 # Haar cascades for face detection. Built into opencv-python-headless, so
@@ -1019,7 +1028,7 @@ def refine_editor_angle(
 
     img = _download_processed_url(source_url)
     enhanced, refine_method = run_enhancement_pipeline(img)
-    cleaned = refine_studio_quality(enhanced)
+    cleaned = refine_studio_quality(enhanced, strength=EDITOR_REFINE_STRENGTH)
     uid = uuid.uuid4().hex[:10]
 
     if label in ANALYSIS_ANGLES:
