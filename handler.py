@@ -69,11 +69,8 @@ MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
 # halos around facial features.
 SHARPEN_AMOUNT = float(os.environ.get("SHARPEN_AMOUNT", "1.15"))
 
-# Initial clean: gemini (shadow + bg via image-edit model) or modnet fallback.
-CLEAN_METHOD = os.environ.get(
-    "CLEAN_METHOD",
-    "gemini" if GEMINI_API_KEY else "modnet",
-).strip().lower()
+# Initial scan clean defaults to MODNet; editor Shadows + Crop uses Gemini per-angle.
+CLEAN_METHOD = os.environ.get("CLEAN_METHOD", "modnet").strip().lower()
 GEMINI_CLEAN_MAX_WORKERS = int(os.environ.get("GEMINI_CLEAN_MAX_WORKERS", "2"))
 
 
@@ -962,6 +959,53 @@ def commit_refined_angle(
     return prev
 
 
+def shadows_crop_angle(
+    scan_id: str,
+    label: str,
+    source_url: str,
+    processed_angles: dict,
+    scan_mode: str = "redness",
+) -> dict:
+    """Editor Shadows + Crop: Gemini shadow/bg clean + sharpen for one angle."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is required for shadows_crop")
+
+    img = _download_processed_url(source_url)
+    cleaned, err = run_gemini_initial_clean(img)
+    if cleaned is None:
+        raise RuntimeError(f"Gemini shadows crop failed: {err}")
+
+    if cleaned.size != (PORTRAIT_WIDTH, PORTRAIT_HEIGHT):
+        cleaned = cleaned.resize(
+            (PORTRAIT_WIDTH, PORTRAIT_HEIGHT), Image.Resampling.LANCZOS
+        )
+
+    finished = refine_studio_quality(_clarity_and_sharpen(cleaned))
+    uid = uuid.uuid4().hex[:10]
+
+    if label in ANALYSIS_ANGLES:
+        clean_url = upload_webp_lossless(finished, f"clean_{label}_{uid}.webp")
+    else:
+        clean_url = upload_webp_visual(finished, f"clean_{label}_{uid}.webp", quality=95)
+
+    prev = dict(processed_angles.get(label) or {})
+    prev["clean_image_url"] = clean_url
+    prev["shadows_crop_at"] = datetime.now(timezone.utc).isoformat()
+    prev["shadows_crop_method"] = "gemini_initial_clean_sharpen"
+    prev["bg_remove_status"] = "done"
+    prev["bg_remove_method"] = "gemini_shadows_crop"
+    prev["bg_remove_error"] = None
+    update_supabase_processed_angle(scan_id, label, prev, processed_angles)
+    print(f"[shadows_crop] {label} OK scan_id={scan_id}")
+    return {
+        "status": "saved",
+        "scan_id": scan_id,
+        "angle": label,
+        "clean_image_url": clean_url,
+        "shadows_crop_method": "gemini_initial_clean_sharpen",
+    }
+
+
 def refine_editor_angle(
     scan_id: str,
     label: str,
@@ -1293,6 +1337,24 @@ def handler(job):
     # Triggered by the "Open in Editor" button. Takes the already-processed
     # clean_image_urls from the initial scan and runs studio-grade halo
     # cleanup + canonical face placement on each angle.
+    if mode == "shadows_crop":
+        label = job_input.get("angle")
+        source_url = job_input.get("clean_image_url")
+        processed_angles = job_input.get("processed_angles") or {}
+        if not scan_id or not label or not source_url:
+            return {"error": "shadows_crop requires scan_id, angle, clean_image_url"}
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+        scan_mode = str(job_input.get("scan_mode") or "redness")
+        print(f"[handler] mode=shadows_crop scan_id={scan_id} angle={label}")
+        return shadows_crop_angle(
+            scan_id,
+            label,
+            source_url,
+            processed_angles,
+            scan_mode=scan_mode,
+        )
+
     if mode == "refine_angle":
         label = job_input.get("angle")
         source_url = job_input.get("clean_image_url")
